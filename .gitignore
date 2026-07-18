@@ -1,0 +1,16 @@
+.env
+.venv/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+data/*.db
+data/*.sqlite
+data/*.db-wal
+data/*.db-shm
+data/raw/*
+!data/raw/.gitkeep

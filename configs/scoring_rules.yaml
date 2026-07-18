@@ -1,0 +1,53 @@
+model_version: rules-v2
+
+score_weights:
+  demand: 25
+  financial: 15
+  valuation: 15
+  structure: 15
+  news_trend: 10
+  allocation: 10
+  market_condition: 10
+  max_risk_penalty: 20
+
+confidence:
+  minimum_for_recommendation: 70
+  critical_features:
+    - demand_forecast
+    - offer_price
+
+recommendation_band:
+  strong: 80
+  watch: 65
+  neutral: 50
+
+market_condition:
+  neutral_score: 5
+  kosdaq_momentum_positive: 0.05
+  kosdaq_momentum_negative: -0.05
+  recent_ipo_success_high: 0.60
+  recent_ipo_success_low: 0.35
+
+risk_keywords:
+  severe:
+    - 횡령
+    - 배임
+    - 상장철회
+    - 감사의견
+    - 과징금
+  normal:
+    - 적자
+    - 고평가
+    - 소송
+    - 정정
+    - 매출채권
+    - 유통가능물량
+
+positive_keywords:
+  - 수주
+  - 흑자전환
+  - 글로벌
+  - 독점
+  - AI
+  - 성장
+  - 기술력

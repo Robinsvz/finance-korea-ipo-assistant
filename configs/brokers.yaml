@@ -1,0 +1,54 @@
+defaults:
+  default_fee: 2000
+  default_deposit_rate: 0.5
+  equal_allocation_ratio: 0.5
+  proportional_allocation_ratio: 0.5
+  expected_applicants_count: 300000
+  proportional_competition:
+    conservative: 2000
+    base: 1000
+    optimistic: 500
+  subscription_units:
+    - {upper_bound: 100, unit: 10}
+    - {upper_bound: 500, unit: 50}
+    - {upper_bound: 1000, unit: 100}
+    - {upper_bound: 5000, unit: 500}
+    - {upper_bound: 10000, unit: 1000}
+    - {upper_bound: 1000000000000, unit: 5000}
+
+brokers:
+  한국투자증권:
+    aliases: [한투, 한국투자, 한국투자증권(주)]
+    default_fee: 2000
+    default_deposit_rate: 0.5
+    account_open_same_day_subscription: false
+  NH투자증권:
+    aliases: [농협, 나무, NH, 엔에이치투자증권, 엔에이치투자증권(주)]
+    default_fee: 2000
+    default_deposit_rate: 0.5
+    account_open_same_day_subscription: unknown
+  미래에셋증권:
+    aliases: [미래에셋, 미래에셋증권 주식회사, 미래에셋증권(주)]
+    default_fee: 2000
+    default_deposit_rate: 0.5
+    account_open_same_day_subscription: unknown
+  삼성증권:
+    aliases: [삼성, 삼성증권(주)]
+    default_fee: 2000
+    default_deposit_rate: 0.5
+    account_open_same_day_subscription: unknown
+  KB증권:
+    aliases: [KB, 케이비, KB증권(주)]
+    default_fee: 1500
+    default_deposit_rate: 0.5
+    account_open_same_day_subscription: unknown
+  신한투자증권:
+    aliases: [신한, 신한투자증권 주식회사, 신한투자증권(주)]
+    default_fee: 2000
+    default_deposit_rate: 0.5
+    account_open_same_day_subscription: unknown
+  대신증권:
+    aliases: [대신, 대신증권(주)]
+    default_fee: 2000
+    default_deposit_rate: 0.5
+    account_open_same_day_subscription: unknown

@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "korea-ipo-telegram-bot"
+version = "1.0.0"
+description = "Korean IPO schedule, scoring, Telegram alerts, allocation calculator, and post-listing evaluation loop."
+requires-python = ">=3.9"
+dependencies = [
+  "alembic>=1.13,<2",
+  "APScheduler>=3.10,<4",
+  "beautifulsoup4>=4.12,<5",
+  "httpx>=0.27,<1",
+  "lxml>=5.0,<7",
+  "numpy>=1.24,<3",
+  "pandas>=2.0,<3",
+  "python-dotenv>=1.0,<2",
+  "python-telegram-bot>=21.0,<23",
+  "PyYAML>=6.0,<7",
+  "SQLAlchemy>=2.0,<3",
+  "exchange-calendars>=4.5,<5",
+]
+
+[project.optional-dependencies]
+market = [
+  "finance-datareader>=0.9.90",
+  "pykrx>=1.0.48",
+]
+dev = [
+  "pytest-cov>=5.0",
+  "pytest>=8.0",
+  "ruff>=0.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = [
+  "app/__init__.py",
+  "app/cli.py",
+  "app/collectors/*",
+  "app/db.py",
+  "app/exceptions.py",
+  "app/models.py",
+  "app/schemas.py",
+  "app/services/formatter.py",
+  "app/services/jobs.py",
+  "app/services/observability.py",
+  "app/services/scheduler.py",
+  "app/services/telegram.py",
+]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true

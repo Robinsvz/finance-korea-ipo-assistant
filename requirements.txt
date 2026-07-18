@@ -1,0 +1,14 @@
+alembic>=1.13,<2
+APScheduler>=3.10,<4
+beautifulsoup4>=4.12,<5
+finance-datareader>=0.9.90
+httpx>=0.27,<1
+lxml>=5.0,<7
+numpy>=1.24,<3
+pandas>=2.0,<3
+pykrx>=1.0.48
+python-dotenv>=1.0,<2
+python-telegram-bot>=21.0,<23
+PyYAML>=6.0,<7
+SQLAlchemy>=2.0,<3
+exchange-calendars>=4.5,<5

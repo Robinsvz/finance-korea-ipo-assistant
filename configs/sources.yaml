@@ -1,0 +1,30 @@
+sources:
+  defaults:
+    timeout_sec: 20
+    max_retries: 3
+    backoff_base_sec: 0.5
+  kind:
+    enabled: true
+    priority: 1
+    request_interval_sec: 5
+    lookback_days: 180
+    lookahead_days: 365
+  dart:
+    enabled: true
+    priority: 1
+    request_interval_sec: 0.2
+    corp_code_cache_hours: 24
+  naver_news:
+    enabled: true
+    priority: 2
+    daily_limit_guard: 20000
+    request_interval_sec: 0.1
+  naver_datalab:
+    enabled: true
+    priority: 2
+  pykrx:
+    enabled: true
+    priority: 1
+  financedatareader:
+    enabled: true
+    priority: 2

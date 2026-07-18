@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements.lock
+      - run: python -m pip install -e . --no-deps
+      - run: ruff check app tests alembic
+      - run: ruff format --check app tests alembic
+      - run: DATABASE_URL=sqlite:///data/ci.db alembic upgrade head
+      - run: DATABASE_URL=sqlite:///data/ci.db alembic check
+      - run: pytest --cov --cov-report=term-missing
+      - run: python -m pip check
