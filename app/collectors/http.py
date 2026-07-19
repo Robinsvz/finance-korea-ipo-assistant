@@ -31,6 +31,8 @@ class ResilientHttpClient:
             settings.http_backoff_base_sec if backoff_base_sec is None else backoff_base_sec
         )
         self.sleep = sleep
+        if self.max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
         if min_interval_sec < 0:
             raise ValueError("min_interval_sec must be non-negative")
         self.min_interval_sec = min_interval_sec
@@ -53,25 +55,25 @@ class ResilientHttpClient:
         self.client.close()
 
     def request(self, method: str, url: str, *, source: str, **kwargs: Any) -> httpx.Response:
-        last_error: Optional[BaseException] = None
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        while True:
             self._pace()
             try:
                 response = self.client.request(method, url, **kwargs)
             except httpx.HTTPError as exc:
-                last_error = exc
                 if attempt >= self.max_retries:
-                    break
+                    raise ExternalSourceError(
+                        f"{source} request failed after retries: {type(exc).__name__}"
+                    ) from exc
                 self.sleep(self._delay(attempt, None))
+                attempt += 1
                 continue
             if response.status_code < 400:
                 return response
             if response.status_code not in RETRYABLE_STATUS or attempt >= self.max_retries:
                 raise ExternalSourceError(f"{source} HTTP {response.status_code}")
             self.sleep(self._delay(attempt, response.headers.get("Retry-After")))
-        raise ExternalSourceError(
-            f"{source} request failed after retries: {type(last_error).__name__}"
-        )
+            attempt += 1
 
     def get_json(self, url: str, *, source: str, **kwargs: Any) -> dict[str, Any]:
         response = self.request("GET", url, source=source, **kwargs)

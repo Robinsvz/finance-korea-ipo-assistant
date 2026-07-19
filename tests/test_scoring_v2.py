@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,7 @@ from app.models import (
 from app.services import scoring
 from app.services.scoring import (
     IpoScoringService,
+    _scale,
     load_scoring_rules,
     recommendation_band,
     score_market_condition,
@@ -274,3 +276,105 @@ def test_full_feature_set_can_reach_100(db_session):
     assert result.confidence_score == 100
     assert result.total_score == 100
     assert result.recommendation_band == "Strong"
+
+
+def test_rules_require_exact_weight_keys(monkeypatch):
+    config = {
+        "score_weights": {"demand": 100},
+        "recommendation_band": {"strong": 80, "watch": 65, "neutral": 50},
+    }
+    monkeypatch.setattr(scoring, "load_yaml_config", lambda _name: config)
+    with pytest.raises(ValueError, match="keys must be exactly"):
+        load_scoring_rules()
+
+
+@pytest.mark.parametrize(
+    ("bands", "message"),
+    [
+        ({"strong": 80}, "requires strong"),
+        ({"strong": 60, "watch": 70, "neutral": 50}, "strictly descending"),
+    ],
+)
+def test_rules_validate_recommendation_bands(monkeypatch, bands, message):
+    config = {
+        "score_weights": {
+            "demand": 25,
+            "financial": 15,
+            "valuation": 15,
+            "structure": 15,
+            "news_trend": 10,
+            "allocation": 10,
+            "market_condition": 10,
+        },
+        "recommendation_band": bands,
+    }
+    monkeypatch.setattr(scoring, "load_yaml_config", lambda _name: config)
+    with pytest.raises(ValueError, match=message):
+        load_scoring_rules()
+
+
+def test_risk_penalty_combines_financial_structure_and_news_risks():
+    financial = FinancialMetric(
+        operating_profit=-1,
+        has_negative_ocf=True,
+        debt_ratio=4,
+    )
+    structure = IpoStructureMetric(
+        secondary_share_ratio=0.6,
+        free_float_ratio_on_listing=0.6,
+        risk_flags_json=["소송", "감사", "소송", "규제"],
+    )
+    news = NewsMetric(risk_keyword_count=5)
+
+    penalty, explanation = score_risk_penalty(financial, structure, news)
+
+    assert penalty == 20
+    assert {"영업손실", "영업현금흐름 음수", "부채비율 높음", "구주매출 과다"}.issubset(
+        explanation["reasons"]
+    )
+
+
+def test_allocation_scoring_handles_errors_and_midrange_expectations(db_session, monkeypatch):
+    ipo = Ipo(
+        corp_name="배정분기",
+        normalized_name="배정분기",
+        status="scheduled",
+        offer_price_final=10_000,
+    )
+    db_session.add(ipo)
+    db_session.flush()
+    service = IpoScoringService()
+
+    monkeypatch.setattr(
+        scoring,
+        "derive_allocation_assumptions",
+        lambda _session, _underwriter: (_ for _ in ()).throw(ValueError("bad assumptions")),
+    )
+    score, detail = service._score_allocation(db_session, ipo)
+    assert score == 0
+    assert detail["reason"] == "bad assumptions"
+
+    monkeypatch.setattr(
+        scoring,
+        "derive_allocation_assumptions",
+        lambda _session, _underwriter: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        scoring,
+        "build_allocation_scenario",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            expected_equal_shares_mid=0.5,
+            expected_proportional_shares_base=0.75,
+            estimated_fee=3_000,
+            broker_name="미지정",
+            apply_shares=100,
+            assumption_source="test",
+        ),
+    )
+    score, detail = service._score_allocation(db_session, ipo)
+    assert score == 3
+    assert detail["expected_equal_mid"] == 0.5
+
+
+def test_scale_returns_zero_for_invalid_native_range():
+    assert _scale(10, 0, 20) == 0

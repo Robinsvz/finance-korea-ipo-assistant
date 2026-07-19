@@ -44,12 +44,21 @@ class Ipo(Base, TimestampMixin):
         unique=True,
         index=True,
     )
+    offering_id = Column(
+        String(320),
+        default=lambda: f"offering:temp:{uuid.uuid4().hex}",
+        nullable=False,
+        unique=True,
+        index=True,
+    )
     corp_name = Column(String(255), nullable=False)
     normalized_name = Column(String(255), nullable=False, index=True)
     ticker = Column(String(20), index=True)
     market = Column(String(50))
     industry = Column(String(255))
     ipo_type = Column(String(50))
+    is_sample = Column(Boolean, default=False, nullable=False, index=True)
+    data_origin = Column(String(50), default="unknown", nullable=False, index=True)
     status = Column(String(50), default="scheduled", index=True)
     status_changed_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
     schedule_version = Column(Integer, default=1, nullable=False)
@@ -88,6 +97,18 @@ class Ipo(Base, TimestampMixin):
     news_metrics = relationship("NewsMetric", back_populates="ipo", cascade="all, delete-orphan")
     search_trends = relationship("SearchTrend", back_populates="ipo", cascade="all, delete-orphan")
     scores = relationship("ScoreSnapshot", back_populates="ipo", cascade="all, delete-orphan")
+    participations = relationship(
+        "UserParticipation", back_populates="ipo", cascade="all, delete-orphan"
+    )
+    source_documents = relationship(
+        "SourceDocument", back_populates="ipo", cascade="all, delete-orphan"
+    )
+    fact_observations = relationship(
+        "IpoFactObservation", back_populates="ipo", cascade="all, delete-orphan"
+    )
+    schedule_revisions = relationship(
+        "IpoScheduleRevision", back_populates="ipo", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -406,6 +427,49 @@ class AllocationScenario(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class UserParticipation(Base, TimestampMixin):
+    __tablename__ = "user_participations"
+
+    id = Column(Integer, primary_key=True)
+    ipo_id = Column(Integer, ForeignKey("ipos.id"), nullable=False, index=True)
+    score_snapshot_id = Column(Integer, ForeignKey("score_snapshots.id"), index=True)
+    broker_name = Column(String(255), nullable=False, index=True)
+    decision_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    decision_action = Column(String(50), nullable=False)
+    user_cash = Column(Integer, nullable=False)
+    applied_shares = Column(Integer, nullable=False)
+    cash_committed = Column(Integer, nullable=False)
+    allocated_shares = Column(Integer)
+    offer_price_snapshot = Column(Numeric(18, 2))
+    subscription_fee = Column(Integer, default=0, nullable=False)
+    note = Column(Text)
+
+    ipo = relationship("Ipo", back_populates="participations")
+    exits = relationship(
+        "ParticipationExit", back_populates="participation", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (UniqueConstraint("ipo_id", "broker_name", name="uq_user_ipo_broker"),)
+
+
+class ParticipationExit(Base):
+    __tablename__ = "participation_exits"
+
+    id = Column(Integer, primary_key=True)
+    participation_id = Column(
+        Integer, ForeignKey("user_participations.id"), nullable=False, index=True
+    )
+    sold_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    strategy = Column(String(50), default="MANUAL", nullable=False)
+    sold_shares = Column(Integer, nullable=False)
+    sell_price = Column(Numeric(18, 2), nullable=False)
+    selling_cost = Column(Integer, default=0, nullable=False)
+    note = Column(Text)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    participation = relationship("UserParticipation", back_populates="exits")
+
+
 class ListingPrice(Base):
     __tablename__ = "listing_prices"
 
@@ -486,6 +550,155 @@ class SourceSnapshot(Base):
     )
 
 
+class SourceDocument(Base):
+    """One immutable source revision belonging to a stable IPO offering."""
+
+    __tablename__ = "source_documents"
+
+    id = Column(Integer, primary_key=True)
+    ipo_id = Column(Integer, ForeignKey("ipos.id"), nullable=False, index=True)
+    source_snapshot_id = Column(Integer, ForeignKey("source_snapshots.id"), index=True)
+    source = Column(String(100), nullable=False, index=True)
+    document_key = Column(String(255), nullable=False)
+    document_type = Column(String(100), nullable=False, index=True)
+    lineage_root_key = Column(String(255), nullable=False, index=True)
+    supersedes_document_id = Column(Integer, ForeignKey("source_documents.id"), index=True)
+    official_url = Column(Text)
+    published_at = Column(DateTime(timezone=True), index=True)
+    fetched_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    raw_text_hash = Column(String(64), index=True)
+    parser_name = Column(String(100))
+    parser_version = Column(String(50))
+    metadata_json = Column(JSON)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    ipo = relationship("Ipo", back_populates="source_documents")
+
+    __table_args__ = (UniqueConstraint("source", "document_key", name="uq_source_document_key"),)
+
+
+class IpoFactObservation(Base):
+    """Append-only field value with point-in-time provenance."""
+
+    __tablename__ = "ipo_fact_observations"
+
+    id = Column(Integer, primary_key=True)
+    observation_key = Column(String(64), nullable=False, unique=True, index=True)
+    ipo_id = Column(Integer, ForeignKey("ipos.id"), nullable=False, index=True)
+    source_document_id = Column(Integer, ForeignKey("source_documents.id"), index=True)
+    field_name = Column(String(120), nullable=False, index=True)
+    value_json = Column(JSON)
+    unit = Column(String(50))
+    quality_state = Column(String(40), nullable=False, index=True)
+    knowledge_phase = Column(String(40), nullable=False, index=True)
+    published_at = Column(DateTime(timezone=True), index=True)
+    observed_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    fetched_at = Column(DateTime(timezone=True), index=True)
+    effective_from = Column(DateTime(timezone=True), index=True)
+    effective_to = Column(DateTime(timezone=True), index=True)
+    parser_name = Column(String(100))
+    parser_version = Column(String(50))
+    raw_text_hash = Column(String(64))
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    ipo = relationship("Ipo", back_populates="fact_observations")
+
+
+class IpoScheduleRevision(Base):
+    """Append-only schedule state emitted by a particular source revision."""
+
+    __tablename__ = "ipo_schedule_revisions"
+
+    id = Column(Integer, primary_key=True)
+    revision_key = Column(String(64), nullable=False, unique=True, index=True)
+    ipo_id = Column(Integer, ForeignKey("ipos.id"), nullable=False, index=True)
+    source_document_id = Column(Integer, ForeignKey("source_documents.id"), index=True)
+    demand_start_date = Column(Date)
+    demand_end_date = Column(Date)
+    subscription_start_date = Column(Date)
+    subscription_end_date = Column(Date)
+    refund_date = Column(Date)
+    payment_date = Column(Date)
+    planned_listing_date = Column(Date)
+    actual_listing_date = Column(Date)
+    event_status = Column(String(50), nullable=False, index=True)
+    withdrawal_reason = Column(Text)
+    published_at = Column(DateTime(timezone=True), index=True)
+    observed_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    effective_from = Column(DateTime(timezone=True), index=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    ipo = relationship("Ipo", back_populates="schedule_revisions")
+
+
+class MonthlyUniverseSnapshot(Base):
+    """An append-only reconciliation result for one IPO in one calendar month."""
+
+    __tablename__ = "monthly_universe_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    month_start = Column(Date, nullable=False, index=True)
+    ipo_id = Column(Integer, ForeignKey("ipos.id"), nullable=False, index=True)
+    offering_id_snapshot = Column(String(320), nullable=False, index=True)
+    cohort = Column(String(40), nullable=False, index=True)
+    event_badges_json = Column(JSON, nullable=False)
+    inclusion_dates_json = Column(JSON, nullable=False)
+    reconciliation_state = Column(String(40), nullable=False, index=True)
+    reconciliation_sources_json = Column(JSON)
+    snapshot_hash = Column(String(64), nullable=False)
+    captured_at = Column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "month_start",
+            "ipo_id",
+            "snapshot_hash",
+            name="uq_monthly_universe_snapshot",
+        ),
+    )
+
+
+class BrokerTermVersion(Base):
+    """Versioned official broker terms; never mixed with allocation assumptions."""
+
+    __tablename__ = "broker_term_versions"
+
+    id = Column(Integer, primary_key=True)
+    version_key = Column(String(64), nullable=False, unique=True, index=True)
+    broker_name = Column(String(255), nullable=False, index=True)
+    source_document_id = Column(Integer, ForeignKey("source_documents.id"), index=True)
+    effective_from = Column(Date, nullable=False, index=True)
+    effective_to = Column(Date, index=True)
+    subscription_fee = Column(Integer)
+    account_open_deadline_rule = Column(String(255))
+    minimum_subscription_shares = Column(Integer)
+    equal_allocation_ratio = Column(Float)
+    proportional_allocation_ratio = Column(Float)
+    terms_json = Column(JSON)
+    official_url = Column(Text)
+    verified_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class DataQualityIssue(Base):
+    """Review queue for missing, conflicting, stale, ambiguous, or leaking facts."""
+
+    __tablename__ = "data_quality_issues"
+
+    id = Column(Integer, primary_key=True)
+    issue_key = Column(String(64), nullable=False, unique=True, index=True)
+    ipo_id = Column(Integer, ForeignKey("ipos.id"), index=True)
+    source_document_id = Column(Integer, ForeignKey("source_documents.id"), index=True)
+    issue_type = Column(String(40), nullable=False, index=True)
+    field_name = Column(String(120), index=True)
+    severity = Column(String(20), nullable=False, index=True)
+    status = Column(String(30), nullable=False, index=True)
+    details_json = Column(JSON)
+    detected_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    resolved_at = Column(DateTime(timezone=True))
+    resolution_note = Column(Text)
+
+
 class DiligenceReview(Base, TimestampMixin):
     __tablename__ = "diligence_reviews"
 
@@ -535,6 +748,47 @@ class NotificationEvent(Base):
     response_json = Column(JSON)
     error_summary = Column(Text)
 
+    content_artifact = relationship(
+        "NotificationContentArtifact",
+        back_populates="notification_event",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
     __table_args__ = (
         UniqueConstraint("channel", "event_key", "recipient", name="uq_notification_event"),
+    )
+
+
+class NotificationContentArtifact(Base):
+    """Immutable, credential-free copy of content attached to one delivery attempt."""
+
+    __tablename__ = "notification_content_artifacts"
+
+    id = Column(Integer, primary_key=True)
+    notification_event_id = Column(
+        Integer,
+        ForeignKey("notification_events.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subject = Column(Text, nullable=False)
+    text_body = Column(Text, nullable=False)
+    html_body = Column(Text, nullable=False)
+    subject_sha256 = Column(String(64), nullable=False)
+    text_sha256 = Column(String(64), nullable=False)
+    html_sha256 = Column(String(64), nullable=False)
+    content_sha256 = Column(String(64), nullable=False, index=True)
+    content_redacted = Column(Boolean, default=False, nullable=False)
+    universe_hash = Column(String(64))
+    evidence_hash = Column(String(64))
+    metadata_json = Column(JSON)
+    recorded_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    notification_event = relationship("NotificationEvent", back_populates="content_artifact")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "notification_event_id",
+            name="uq_notification_content_artifact_event",
+        ),
     )

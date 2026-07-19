@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "korea-ipo-telegram-bot"
-version = "1.0.0"
-description = "Korean IPO schedule, scoring, Telegram alerts, allocation calculator, and post-listing evaluation loop."
+version = "1.2.0"
+description = "Point-in-time Korean IPO analysis, Telegram and email alerts, allocation, validation, and realized-outcome tracking."
 requires-python = ">=3.9"
 dependencies = [
   "alembic>=1.13,<2",
@@ -28,6 +28,9 @@ market = [
   "pykrx>=1.0.48",
 ]
 dev = [
+  "ipykernel>=6.29,<7",
+  "nbclient>=0.10,<1",
+  "nbformat>=5.10,<6",
   "pytest-cov>=5.0",
   "pytest>=8.0",
   "ruff>=0.5",
@@ -49,21 +52,8 @@ select = ["E", "F", "I", "B"]
 
 [tool.coverage.run]
 source = ["app"]
-omit = [
-  "app/__init__.py",
-  "app/cli.py",
-  "app/collectors/*",
-  "app/db.py",
-  "app/exceptions.py",
-  "app/models.py",
-  "app/schemas.py",
-  "app/services/formatter.py",
-  "app/services/jobs.py",
-  "app/services/observability.py",
-  "app/services/scheduler.py",
-  "app/services/telegram.py",
-]
+branch = true
 
 [tool.coverage.report]
-fail_under = 80
+fail_under = 100
 show_missing = true

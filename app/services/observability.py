@@ -10,10 +10,15 @@ from sqlalchemy import desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.db import init_db, session_scope
-from app.models import JobRun, NotificationEvent
+from app.models import JobRun, NotificationContentArtifact, NotificationEvent
+from app.repositories import save_notification_content_artifact
 
 SECRET_PATTERNS = (
-    re.compile(r"(?i)(crtfc_key|api[_-]?key|token|client_secret)=([^&\s]+)"),
+    re.compile(
+        r"(?i)(crtfc_key|api[_-]?key|token|client_secret|smtp[_-]?password|password|passwd)"
+        r"=([^&\s]+)"
+    ),
+    re.compile(r"(?i)(smtps?://[^:/\s]+:)([^@/\s]+)(@)"),
     re.compile(r"/bot[^/\s]+/"),
     re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]+"),
 )
@@ -43,15 +48,15 @@ def run_tracked_job(job_name: str, fn: Callable[[], Any]) -> Any:
             result, ("processed", "records", "checked", "scored", "items")
         )
         row.success_count = _extract_count(
-            result, ("success", "updated", "scored", "records", "items")
+            result, ("success", "sent", "updated", "scored", "records", "items")
         )
         row.partial_count = _extract_count(result, ("partial",))
-        row.skipped_count = _extract_count(result, ("skipped",))
+        row.skipped_count = _extract_skipped_count(result)
         row.failure_count = _extract_count(result, ("failed", "failures"))
         if row.failure_count or row.partial_count:
             row.status = "partial"
-        elif row.skipped_count and not row.success_count:
-            row.status = "skipped"
+        elif row.skipped_count:
+            row.status = "partial" if row.success_count else "skipped"
         else:
             row.status = "succeeded"
     return result
@@ -131,6 +136,19 @@ def reserve_notification(
             NotificationEvent.event_key == event_key,
             NotificationEvent.recipient == recipient,
         )
+        existing = session.execute(select(NotificationEvent).where(*predicate)).scalar_one()
+        handed_to_email_transport = (
+            channel == "email"
+            and existing.status == "pending"
+            and session.execute(
+                select(NotificationContentArtifact.id).where(
+                    NotificationContentArtifact.notification_event_id == existing.id
+                )
+            ).scalar_one_or_none()
+            is not None
+        )
+        if handed_to_email_transport:
+            return existing, False
         acquired = session.execute(
             update(NotificationEvent)
             .where(
@@ -172,11 +190,46 @@ def finish_notification(
         event.error_summary = mask_secrets(error or "")[:2000] or None
 
 
+def record_notification_content(
+    event_id: int,
+    *,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    universe_hash: Optional[str] = None,
+    evidence_hash: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> None:
+    """Persist a safe, immutable audit copy before an email is handed to SMTP."""
+
+    safe_subject = mask_secrets(subject)
+    safe_text = mask_secrets(text_body)
+    safe_html = mask_secrets(html_body)
+    safe_metadata = sanitize_data(metadata) if metadata is not None else None
+    if safe_metadata is not None and not isinstance(safe_metadata, dict):
+        raise ValueError("notification content metadata must be a mapping")
+    with session_scope() as session:
+        save_notification_content_artifact(
+            session,
+            notification_event_id=event_id,
+            subject=safe_subject,
+            text_body=safe_text,
+            html_body=safe_html,
+            content_redacted=(safe_subject, safe_text, safe_html)
+            != (subject, text_body, html_body),
+            universe_hash=universe_hash,
+            evidence_hash=evidence_hash,
+            metadata=safe_metadata,
+        )
+
+
 def mask_secrets(value: str) -> str:
     masked = value
     for pattern in SECRET_PATTERNS:
         if pattern.pattern.startswith("/bot"):
             masked = pattern.sub("/bot***REDACTED***/", masked)
+        elif pattern.pattern.startswith("(?i)(smtps?"):
+            masked = pattern.sub(r"\1***REDACTED***\3", masked)
         elif pattern.pattern.startswith("(?i)bearer"):
             masked = pattern.sub("Bearer ***REDACTED***", masked)
         else:
@@ -206,9 +259,26 @@ def _extract_count(result: Any, keys: tuple[str, ...]) -> int:
         return 0
     for key in keys:
         value = result.get(key)
-        if isinstance(value, int):
+        if isinstance(value, int) and not isinstance(value, bool):
             return value
     return 0
+
+
+def _extract_skipped_count(result: Any) -> int:
+    if not isinstance(result, dict):
+        return 0
+    duplicate = result.get("duplicate", 0)
+    duplicate_count = (
+        duplicate if isinstance(duplicate, int) and not isinstance(duplicate, bool) else 0
+    )
+    skipped = result.get("skipped", 0)
+    if isinstance(skipped, bool):
+        skipped_count = int(skipped)
+    elif isinstance(skipped, int):
+        skipped_count = skipped
+    else:
+        skipped_count = 0
+    return duplicate_count + skipped_count
 
 
 def _json_safe_result(result: Any) -> dict[str, Any]:

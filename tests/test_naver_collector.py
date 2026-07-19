@@ -1,16 +1,24 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import format_datetime
+from types import SimpleNamespace
+
+import pytest
 
 from app.collectors.naver import (
+    NaverClient,
     NaverDataLabCollector,
     NaverNewsCollector,
+    _clean_news_item,
     _dedupe_articles,
     _is_relevant_article,
     _keyword_article_count,
+    _keyword_count,
     _major_media_count,
     _normalize_url,
     _risk_event_article_count,
+    _top_keywords,
 )
+from app.exceptions import ExternalSourceError, MissingCredentialError
 
 
 def _item(title, link="https://example.com/a", description="공모주 청약", pub_date=None):
@@ -157,3 +165,175 @@ def test_datalab_zero_ratio_is_one_for_empty_series():
     result = NaverDataLabCollector(client=EmptyClient()).collect("ABC", ["ABC"])
     assert result.zero_data_ratio == 1.0
     assert result.trend_growth_rate == 0.0
+
+
+class FakeHttpClient(DummyContext):
+    def __init__(self, *, get_data=None, post_data=None):
+        self.get_data = get_data
+        self.post_data = post_data
+        self.calls = []
+
+    def get_json(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self.get_data
+
+    def post_json(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.post_data
+
+
+def test_naver_client_constructor_headers_and_http_factory(monkeypatch):
+    settings = SimpleNamespace(
+        naver_client_id="",
+        naver_client_secret="",
+        http_timeout_sec=3,
+    )
+    monkeypatch.setattr("app.collectors.naver.get_settings", lambda: settings)
+    monkeypatch.setattr("app.collectors.naver.load_yaml_config", lambda _name: {"sources": {}})
+    with pytest.raises(MissingCredentialError):
+        NaverClient()
+
+    client = NaverClient("id", "secret", timeout=1)
+    assert client.headers == {
+        "X-Naver-Client-Id": "id",
+        "X-Naver-Client-Secret": "secret",
+    }
+    http_client = client.http_client()
+    assert http_client.min_interval_sec == 0
+    http_client.close()
+
+
+def test_naver_news_api_validation_owned_supplied_and_error(monkeypatch):
+    client = object.__new__(NaverClient)
+    client.client_id = "id"
+    client.client_secret = "secret"
+    client.timeout = 1
+    client.request_interval_sec = 0
+    with pytest.raises(ValueError, match="outside API limits"):
+        client.search_news("A", display=0)
+    with pytest.raises(ValueError, match="outside API limits"):
+        client.search_news("A", start=1001)
+
+    owned = FakeHttpClient(get_data={"items": []})
+    monkeypatch.setattr(client, "http_client", lambda: owned)
+    assert client.search_news("A") == {"items": []}
+    assert owned.calls[0][0] == "GET"
+
+    supplied = FakeHttpClient(get_data={"errorCode": "E", "errorMessage": "bad"})
+    with pytest.raises(ExternalSourceError, match="Naver News error E"):
+        client.search_news("A", client=supplied)
+
+
+def test_naver_datalab_validation_payload_keyword_limit_and_error(monkeypatch):
+    client = object.__new__(NaverClient)
+    client.client_id = "id"
+    client.client_secret = "secret"
+    client.timeout = 1
+    client.request_interval_sec = 0
+    with pytest.raises(ValueError, match="at least one"):
+        client.datalab_search("A", [" ", ""], date(2026, 1, 1), date(2026, 1, 2))
+    with pytest.raises(ValueError, match="must not be after"):
+        client.datalab_search("A", ["A"], date(2026, 1, 2), date(2026, 1, 1))
+
+    http = FakeHttpClient(post_data={"results": []})
+    monkeypatch.setattr(client, "http_client", lambda: http)
+    keywords = [f" k{index} " for index in range(25)]
+    assert client.datalab_search("A", keywords, date(2026, 1, 1), date(2026, 1, 2)) == {
+        "results": []
+    }
+    sent_keywords = http.calls[0][2]["json"]["keywordGroups"][0]["keywords"]
+    assert len(sent_keywords) == 20
+    assert sent_keywords[0] == "k0"
+
+    http.post_data = {"errorCode": "E", "errorMessage": "bad"}
+    with pytest.raises(ExternalSourceError, match="DataLab error E"):
+        client.datalab_search("A", ["A"], date(2026, 1, 1), date(2026, 1, 2))
+
+
+def test_news_collector_default_client_and_short_window(monkeypatch):
+    fake = FakeNewsClient([{"total": 0, "items": []}])
+    monkeypatch.setattr("app.collectors.naver.NaverClient", lambda: fake)
+    collector = NaverNewsCollector()
+    assert collector.client is fake
+    with pytest.raises(ValueError, match="at least 14"):
+        collector.collect("ABC", window_days=13)
+
+
+def test_news_collection_stops_on_empty_and_old_page(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr("app.collectors.naver.local_today", lambda: today)
+    empty_client = FakeNewsClient([{"total": 1000, "items": []}])
+    assert NaverNewsCollector(client=empty_client).collect("ABC").deduped_article_count == 0
+    assert empty_client.calls == 1
+
+    old = datetime.combine(today - timedelta(days=40), datetime.min.time(), tzinfo=timezone.utc)
+    old_client = FakeNewsClient([{"total": 1000, "items": [_item("ABC 공모주", pub_date=old)]}])
+    result = NaverNewsCollector(client=old_client).collect("ABC", window_days=30)
+    assert result.deduped_article_count == 0
+    assert old_client.calls == 1
+
+
+def test_news_collection_stops_at_naver_thousand_result_cap(monkeypatch):
+    today = date(2026, 7, 20)
+    monkeypatch.setattr("app.collectors.naver.local_today", lambda: today)
+    pages = [
+        {
+            "total": 2000,
+            "items": [
+                _item(
+                    f"ABC 공모주 {index}",
+                    link=f"https://example.com/{index}",
+                    pub_date=datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc),
+                )
+            ],
+        }
+        for index in range(10)
+    ]
+    client = FakeNewsClient(pages)
+    result = NaverNewsCollector(client=client).collect("ABC")
+    assert client.calls == 10
+    assert result.deduped_article_count == 10
+
+
+def test_datalab_short_window_small_series_and_positive_zero_baseline():
+    with pytest.raises(ValueError, match="at least 8"):
+        NaverDataLabCollector(client=FakeDataLabClient()).collect("A", ["A"], window_days=7)
+
+    class SmallClient:
+        def datalab_search(self, *_args, **_kwargs):
+            return {"results": [{"data": [{"ratio": 0}, {"ratio": 3}]}]}
+
+    result = NaverDataLabCollector(client=SmallClient()).collect("A", ["A"], window_days=8)
+    assert result.baseline_avg_index == 1.5
+    assert result.peak_index == 3
+    assert result.trend_acceleration == 0
+
+
+def test_news_helpers_handle_invalid_dates_urls_empty_identity_and_keywords():
+    cleaned = _clean_news_item(
+        {
+            "title": "&lt;b&gt;ABC&lt;/b&gt; <b>공모</b>",
+            "description": "설명",
+            "pubDate": "invalid",
+        }
+    )
+    assert cleaned["title"] == "ABC 공모"
+    assert cleaned["pub_date"] is None
+
+    cleaned_without_date = _clean_news_item({"title": "A"})
+    assert cleaned_without_date["pub_date"] is None
+
+    items = [
+        {"title": "", "originallink": "", "link": ""},
+        {"title": "", "originallink": "https://example.com/url-only", "link": ""},
+        {"title": "Only title", "originallink": "", "link": ""},
+        {"title": "Another", "originallink": "", "link": ""},
+        {"title": "Another", "originallink": "", "link": ""},
+    ]
+    deduped = _dedupe_articles(items)
+    assert [item["title"] for item in deduped] == ["", "Only title", "Another"]
+    assert _normalize_url("http://[invalid") == "http://[invalid"
+    assert _major_media_count([{"originallink": "http://[invalid"}]) == 0
+    assert _keyword_count("공모 공모 상장", ["공모", "상장"]) == 3
+    assert _risk_event_article_count([{"title": "무관", "description": ""}], ["소송"]) == 0
+    assert _top_keywords("공모 ABC ABC 상장 테스트")[0] == {"keyword": "ABC", "count": 2}

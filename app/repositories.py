@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional, Union
 
@@ -10,20 +11,33 @@ from sqlalchemy.orm import Session
 from app.config import load_yaml_config
 from app.models import (
     AllocationScenario,
+    BrokerTermVersion,
+    DataQualityIssue,
     DemandForecast,
     DiligenceReview,
     FinancialMetric,
     FinancialStatement,
     Ipo,
+    IpoFactObservation,
+    IpoScheduleRevision,
     ListingPrice,
+    MonthlyUniverseSnapshot,
     NewsMetric,
+    NotificationContentArtifact,
+    NotificationEvent,
     OutcomeEvaluation,
     ScoreSnapshot,
     SearchTrend,
+    SourceDocument,
     SourceSnapshot,
     UnderwriterAllocation,
 )
-from app.schemas import AllocationResult, IpoScheduleRecord
+from app.schemas import (
+    AllocationResult,
+    IpoScheduleRecord,
+    MonthlyUniverseEntry,
+    MonthlyUniverseResult,
+)
 from app.services.clock import local_today
 from app.services.normalization import normalize_broker_name, normalize_company_name
 
@@ -34,6 +48,15 @@ ACTIVE_IPO_STATUSES = {
     "subscription_closed",
 }
 TERMINAL_IPO_STATUSES = {"withdrawn", "archived"}
+NON_PRODUCTION_ORIGINS = {"sample", "synthetic", "test"}
+MONTHLY_EVENT_ORDER = (
+    "demand_forecast",
+    "subscription",
+    "refund",
+    "payment",
+    "actual_listing",
+    "planned_listing",
+)
 
 
 def find_ipo(
@@ -108,25 +131,204 @@ def get_ipo_or_raise(session: Session, identifier: Union[str, int]) -> Ipo:
 
 
 def list_ipos_between(session: Session, start: date, end: date) -> list[Ipo]:
-    stmt = (
-        select(Ipo)
-        .where(
-            or_(
-                and_(Ipo.subscription_start_date >= start, Ipo.subscription_start_date <= end),
-                and_(Ipo.listing_date >= start, Ipo.listing_date <= end),
-                and_(Ipo.refund_date >= start, Ipo.refund_date <= end),
-                and_(Ipo.demand_start_date >= start, Ipo.demand_start_date <= end),
-            )
-        )
-        .order_by(Ipo.subscription_start_date.is_(None), Ipo.subscription_start_date, Ipo.corp_name)
+    return [entry.ipo for entry in list_monthly_universe(session, start, end).core]
+
+
+def list_monthly_universe(
+    session: Session, month_start: date, month_end: date
+) -> MonthlyUniverseResult:
+    """Return production IPO activity; filing-only rows never inflate the core count."""
+    if month_start > month_end:
+        raise ValueError("month_start must be on or before month_end")
+
+    demand_overlap = _period_overlap_predicate(
+        Ipo.demand_start_date, Ipo.demand_end_date, month_start, month_end
     )
-    return list(session.execute(stmt).unique().scalars())
+    subscription_overlap = _period_overlap_predicate(
+        Ipo.subscription_start_date,
+        Ipo.subscription_end_date,
+        month_start,
+        month_end,
+    )
+    single_date_predicates = tuple(
+        field.between(month_start, month_end)
+        for field in (
+            Ipo.refund_date,
+            Ipo.payment_date,
+            Ipo.listing_date,
+            Ipo.actual_listing_date,
+        )
+    )
+    core_predicate = or_(demand_overlap, subscription_overlap, *single_date_predicates)
+    production_predicate = _production_ipo_predicate()
+    core_rows = list(
+        session.execute(select(Ipo).where(production_predicate, core_predicate)).scalars()
+    )
+    core_ids = {row.id for row in core_rows}
+    appendix_rows = list(
+        session.execute(
+            select(Ipo).where(
+                production_predicate,
+                Ipo.report_filed_date.between(month_start, month_end),
+                Ipo.id.notin_(core_ids),
+            )
+        ).scalars()
+    )
+
+    reconciliation = _latest_monthly_reconciliation(
+        session, month_start, [*core_rows, *appendix_rows]
+    )
+    core = tuple(
+        sorted(
+            (
+                _monthly_entry(
+                    ipo,
+                    month_start,
+                    month_end,
+                    reconciliation.get(ipo.id, "unreconciled"),
+                )
+                for ipo in core_rows
+            ),
+            key=lambda entry: _monthly_entry_sort_key(entry, month_start),
+        )
+    )
+    appendix = tuple(
+        sorted(
+            (
+                _filing_appendix_entry(ipo, reconciliation.get(ipo.id, "unreconciled"))
+                for ipo in appendix_rows
+            ),
+            key=lambda entry: (entry.inclusion_dates["filing_update"][0], entry.ipo.corp_name),
+        )
+    )
+    return MonthlyUniverseResult(
+        month_start=month_start,
+        month_end=month_end,
+        core=core,
+        filing_update_appendix=appendix,
+    )
+
+
+def _period_overlap_predicate(start_field, end_field, start: date, end: date):
+    return and_(
+        or_(start_field.is_not(None), end_field.is_not(None)),
+        or_(start_field.is_(None), start_field <= end),
+        or_(end_field.is_(None), end_field >= start),
+    )
+
+
+def _production_ipo_predicate():
+    return and_(
+        Ipo.is_sample.is_(False),
+        Ipo.data_origin.notin_(NON_PRODUCTION_ORIGINS),
+    )
+
+
+def _monthly_entry(
+    ipo: Ipo,
+    month_start: date,
+    month_end: date,
+    reconciliation_state: str,
+) -> MonthlyUniverseEntry:
+    inclusion_dates: dict[str, tuple[date, ...]] = {}
+    if _dates_overlap(ipo.demand_start_date, ipo.demand_end_date, month_start, month_end):
+        inclusion_dates["demand_forecast"] = _known_dates(
+            ipo.demand_start_date, ipo.demand_end_date
+        )
+    if _dates_overlap(
+        ipo.subscription_start_date,
+        ipo.subscription_end_date,
+        month_start,
+        month_end,
+    ):
+        inclusion_dates["subscription"] = _known_dates(
+            ipo.subscription_start_date, ipo.subscription_end_date
+        )
+    for badge, event_date in (
+        ("refund", ipo.refund_date),
+        ("payment", ipo.payment_date),
+        ("actual_listing", ipo.actual_listing_date),
+        ("planned_listing", ipo.listing_date),
+    ):
+        if event_date is not None and month_start <= event_date <= month_end:
+            inclusion_dates[badge] = (event_date,)
+    event_badges = tuple(badge for badge in MONTHLY_EVENT_ORDER if badge in inclusion_dates)
+    offering_id = ipo.offering_id or ipo.identity_key
+    return MonthlyUniverseEntry(
+        ipo=ipo,
+        ipo_id=ipo.id,
+        offering_id=offering_id,
+        event_badges=event_badges,
+        inclusion_dates=inclusion_dates,
+        reconciliation_state=reconciliation_state,
+        planned_listing_date=ipo.listing_date,
+        actual_listing_date=ipo.actual_listing_date,
+        display_listing_date=ipo.actual_listing_date or ipo.listing_date,
+    )
+
+
+def _filing_appendix_entry(ipo: Ipo, reconciliation_state: str) -> MonthlyUniverseEntry:
+    filing_date = ipo.report_filed_date
+    if filing_date is None:
+        raise ValueError("filing appendix rows require report_filed_date")
+    return MonthlyUniverseEntry(
+        ipo=ipo,
+        ipo_id=ipo.id,
+        offering_id=ipo.offering_id or ipo.identity_key,
+        event_badges=("filing_update",),
+        inclusion_dates={"filing_update": (filing_date,)},
+        reconciliation_state=reconciliation_state,
+        planned_listing_date=ipo.listing_date,
+        actual_listing_date=ipo.actual_listing_date,
+        display_listing_date=ipo.actual_listing_date or ipo.listing_date,
+    )
+
+
+def _dates_overlap(first: Optional[date], second: Optional[date], start: date, end: date) -> bool:
+    if first is None and second is None:
+        return False
+    effective_start = first or second
+    effective_end = second or first
+    return bool(effective_start <= end and effective_end >= start)
+
+
+def _known_dates(*values: Optional[date]) -> tuple[date, ...]:
+    return tuple(value for value in values if value is not None)
+
+
+def _monthly_entry_sort_key(entry: MonthlyUniverseEntry, month_start: date) -> tuple[date, str]:
+    dates = [value for values in entry.inclusion_dates.values() for value in values]
+    first_relevant_date = min(max(value, month_start) for value in dates)
+    return first_relevant_date, entry.ipo.corp_name
+
+
+def _latest_monthly_reconciliation(
+    session: Session, month_start: date, ipos: list[Ipo]
+) -> dict[int, str]:
+    ipo_ids = [ipo.id for ipo in ipos]
+    if not ipo_ids:
+        return {}
+    rows = session.execute(
+        select(MonthlyUniverseSnapshot)
+        .where(
+            MonthlyUniverseSnapshot.month_start == month_start,
+            MonthlyUniverseSnapshot.ipo_id.in_(ipo_ids),
+        )
+        .order_by(
+            desc(MonthlyUniverseSnapshot.captured_at),
+            desc(MonthlyUniverseSnapshot.id),
+        )
+    ).scalars()
+    result: dict[int, str] = {}
+    for row in rows:
+        result.setdefault(row.ipo_id, row.reconciliation_state)
+    return result
 
 
 def list_active_ipos(session: Session) -> list[Ipo]:
     stmt = (
         select(Ipo)
-        .where(Ipo.status.in_(ACTIVE_IPO_STATUSES))
+        .where(_production_ipo_predicate(), Ipo.status.in_(ACTIVE_IPO_STATUSES))
         .order_by(Ipo.subscription_start_date.is_(None), Ipo.subscription_start_date, Ipo.corp_name)
     )
     return list(session.execute(stmt).scalars())
@@ -137,6 +339,7 @@ def list_price_due_ipos(session: Session, today: Optional[date] = None) -> list[
     stmt = (
         select(Ipo)
         .where(
+            _production_ipo_predicate(),
             Ipo.ticker.is_not(None),
             Ipo.listing_date.is_not(None),
             Ipo.listing_date <= today,
@@ -153,6 +356,7 @@ def list_evaluation_due_ipos(session: Session) -> list[Ipo]:
         select(Ipo)
         .join(ListingPrice, ListingPrice.ipo_id == Ipo.id)
         .where(
+            _production_ipo_predicate(),
             ListingPrice.d3_close_price.is_not(None),
             Ipo.status.in_({"listed", "subscription_closed"}),
         )
@@ -181,6 +385,7 @@ def upsert_schedule_record(session: Session, record: IpoScheduleRecord) -> Ipo:
         ).first()
         ipo = Ipo(
             identity_key=candidate_identity,
+            offering_id=_new_offering_id(record),
             corp_name=record.corp_name,
             normalized_name=normalized_name,
             subscription_start_date=record.subscription_start_date,
@@ -198,6 +403,8 @@ def upsert_schedule_record(session: Session, record: IpoScheduleRecord) -> Ipo:
     previous_status = ipo.status
     ipo.corp_name = record.corp_name
     ipo.normalized_name = normalize_company_name(record.corp_name)
+    ipo.is_sample = False
+    ipo.data_origin = record.source
     _assign_if_present(ipo, "market", record.market)
     _assign_if_present(ipo, "kind_biz_no", record.kind_biz_no)
     _assign_if_present(ipo, "report_filed_date", record.report_filed_date)
@@ -218,6 +425,7 @@ def upsert_schedule_record(session: Session, record: IpoScheduleRecord) -> Ipo:
     _assign_if_present(ipo, "listing_date", record.listing_date)
     ipo.source_confidence = max(ipo.source_confidence or 0, record.source_confidence)
     ipo.identity_key = build_ipo_identity(ipo)
+    ipo.offering_id = build_offering_id(ipo)
     ipo.status = derive_status(ipo)
     if ipo.status != previous_status:
         ipo.status_changed_at = datetime.now(timezone.utc)
@@ -295,6 +503,26 @@ def build_ipo_identity(ipo: Ipo) -> str:
     return f"name:{ipo.normalized_name}:{schedule}:v{ipo.schedule_version or 1}"
 
 
+def build_offering_id(ipo: Ipo) -> str:
+    """Build a stable offering identity without a revision-specific receipt number."""
+    if ipo.kind_biz_no:
+        return f"kind:{ipo.kind_biz_no}"
+    if ipo.dart_corp_code:
+        cycle = _offering_cycle_date(ipo)
+        return f"dart:{ipo.dart_corp_code}:equity:{cycle}"
+    if ipo.ticker:
+        cycle = ipo.actual_listing_date or ipo.listing_date
+        suffix = cycle.isoformat() if cycle else "unknown"
+        return f"krx:{ipo.ticker}:{suffix}"
+    current = ipo.offering_id or ""
+    if current and not current.startswith("offering:temp:"):
+        return current
+    cycle = _offering_cycle_date(ipo)
+    if cycle != "unknown":
+        return f"name:{ipo.normalized_name}:{cycle}"
+    return current or f"offering:temp:{hashlib.sha256(ipo.identity_key.encode()).hexdigest()}"
+
+
 def _new_schedule_identity(record: IpoScheduleRecord) -> str:
     if record.kind_biz_no:
         return f"kind:{record.kind_biz_no}"
@@ -304,6 +532,33 @@ def _new_schedule_identity(record: IpoScheduleRecord) -> str:
     raw_key = (record.raw or {}).get("source_key")
     suffix = str(raw_key or record.corp_name)
     return f"name:{normalize_company_name(record.corp_name)}:{schedule}:{suffix}"
+
+
+def _new_offering_id(record: IpoScheduleRecord) -> str:
+    if record.kind_biz_no:
+        return f"kind:{record.kind_biz_no}"
+    if record.subscription_start_date:
+        return (
+            f"name:{normalize_company_name(record.corp_name)}:"
+            f"{record.subscription_start_date.isoformat()}"
+        )
+    return f"offering:temp:{uuid_from_source_record(record)}"
+
+
+def uuid_from_source_record(record: IpoScheduleRecord) -> str:
+    raw_key = (record.raw or {}).get("source_key")
+    value = f"{record.source}:{raw_key or record.corp_name}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _offering_cycle_date(ipo: Ipo) -> str:
+    cycle = (
+        ipo.subscription_start_date
+        or ipo.report_filed_date
+        or ipo.actual_listing_date
+        or ipo.listing_date
+    )
+    return cycle.isoformat() if cycle else "unknown"
 
 
 def refresh_ipo_statuses(session: Session, today: Optional[date] = None) -> dict[str, int]:
@@ -364,6 +619,246 @@ def save_source_snapshot(
     )
     session.add(snapshot)
     return snapshot
+
+
+def save_source_document(
+    session: Session,
+    *,
+    ipo_id: int,
+    source: str,
+    document_key: str,
+    document_type: str,
+    lineage_root_key: Optional[str] = None,
+    values: Optional[dict[str, Any]] = None,
+) -> SourceDocument:
+    """Persist a source revision once; a revision cannot move between offerings."""
+    existing = session.execute(
+        select(SourceDocument).where(
+            SourceDocument.source == source,
+            SourceDocument.document_key == document_key,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.ipo_id != ipo_id:
+            raise ValueError("source document is already linked to another offering")
+        return existing
+    document = SourceDocument(
+        ipo_id=ipo_id,
+        source=source,
+        document_key=document_key,
+        document_type=document_type,
+        lineage_root_key=lineage_root_key or document_key,
+    )
+    _set_fields(document, values or {})
+    session.add(document)
+    return document
+
+
+def append_fact_observation(
+    session: Session,
+    *,
+    ipo_id: int,
+    field_name: str,
+    value: Any,
+    quality_state: str,
+    knowledge_phase: str,
+    source_document_id: Optional[int] = None,
+    unit: Optional[str] = None,
+    values: Optional[dict[str, Any]] = None,
+) -> IpoFactObservation:
+    """Append a fact observation, while making identical collector retries idempotent."""
+    extras = values or {}
+    observation_key = _semantic_hash(
+        {
+            "ipo_id": ipo_id,
+            "source_document_id": source_document_id,
+            "field_name": field_name,
+            "value": value,
+            "unit": unit,
+            "quality_state": quality_state,
+            "knowledge_phase": knowledge_phase,
+            "published_at": extras.get("published_at"),
+            "fetched_at": extras.get("fetched_at"),
+            "effective_from": extras.get("effective_from"),
+            "raw_text_hash": extras.get("raw_text_hash"),
+        }
+    )
+    existing = session.execute(
+        select(IpoFactObservation).where(IpoFactObservation.observation_key == observation_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    observation = IpoFactObservation(
+        observation_key=observation_key,
+        ipo_id=ipo_id,
+        source_document_id=source_document_id,
+        field_name=field_name,
+        value_json=value,
+        unit=unit,
+        quality_state=quality_state,
+        knowledge_phase=knowledge_phase,
+    )
+    _set_fields(observation, extras)
+    session.add(observation)
+    return observation
+
+
+def append_schedule_revision(
+    session: Session,
+    *,
+    ipo_id: int,
+    event_status: str,
+    source_document_id: Optional[int] = None,
+    values: Optional[dict[str, Any]] = None,
+) -> IpoScheduleRevision:
+    """Append one normalized schedule state without overwriting earlier revisions."""
+    extras = values or {}
+    revision_key = _semantic_hash(
+        {
+            "ipo_id": ipo_id,
+            "source_document_id": source_document_id,
+            "event_status": event_status,
+            **extras,
+        }
+    )
+    existing = session.execute(
+        select(IpoScheduleRevision).where(IpoScheduleRevision.revision_key == revision_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    revision = IpoScheduleRevision(
+        revision_key=revision_key,
+        ipo_id=ipo_id,
+        source_document_id=source_document_id,
+        event_status=event_status,
+    )
+    _set_fields(revision, extras)
+    session.add(revision)
+    return revision
+
+
+def save_monthly_universe_snapshot(
+    session: Session,
+    universe: MonthlyUniverseResult,
+    *,
+    reconciliation_state: str,
+    reconciliation_sources: Iterable[str],
+) -> list[MonthlyUniverseSnapshot]:
+    """Persist one idempotent reconciliation snapshot for every visible offering."""
+    sources = tuple(sorted(set(reconciliation_sources)))
+    rows: list[MonthlyUniverseSnapshot] = []
+    for cohort, entries in (
+        ("core", universe.core),
+        ("filing_update_appendix", universe.filing_update_appendix),
+    ):
+        for entry in entries:
+            payload = {
+                "month_start": universe.month_start,
+                "ipo_id": entry.ipo_id,
+                "offering_id": entry.offering_id,
+                "cohort": cohort,
+                "event_badges": entry.event_badges,
+                "inclusion_dates": entry.inclusion_dates,
+                "reconciliation_state": reconciliation_state,
+                "sources": sources,
+            }
+            snapshot_hash = _semantic_hash(payload)
+            existing = session.execute(
+                select(MonthlyUniverseSnapshot).where(
+                    MonthlyUniverseSnapshot.month_start == universe.month_start,
+                    MonthlyUniverseSnapshot.ipo_id == entry.ipo_id,
+                    MonthlyUniverseSnapshot.snapshot_hash == snapshot_hash,
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                rows.append(existing)
+                continue
+            snapshot = MonthlyUniverseSnapshot(
+                month_start=universe.month_start,
+                ipo_id=entry.ipo_id,
+                offering_id_snapshot=entry.offering_id,
+                cohort=cohort,
+                event_badges_json=list(entry.event_badges),
+                inclusion_dates_json={
+                    badge: [value.isoformat() for value in dates]
+                    for badge, dates in entry.inclusion_dates.items()
+                },
+                reconciliation_state=reconciliation_state,
+                reconciliation_sources_json=list(sources),
+                snapshot_hash=snapshot_hash,
+            )
+            session.add(snapshot)
+            rows.append(snapshot)
+    return rows
+
+
+def save_broker_term_version(
+    session: Session,
+    *,
+    broker_name: str,
+    effective_from: date,
+    values: Optional[dict[str, Any]] = None,
+) -> BrokerTermVersion:
+    extras = values or {}
+    version_key = _semantic_hash(
+        {"broker_name": broker_name, "effective_from": effective_from, **extras}
+    )
+    existing = session.execute(
+        select(BrokerTermVersion).where(BrokerTermVersion.version_key == version_key)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    version = BrokerTermVersion(
+        version_key=version_key,
+        broker_name=broker_name,
+        effective_from=effective_from,
+    )
+    _set_fields(version, extras)
+    session.add(version)
+    return version
+
+
+def upsert_data_quality_issue(
+    session: Session,
+    *,
+    issue_type: str,
+    severity: str,
+    status: str,
+    ipo_id: Optional[int] = None,
+    source_document_id: Optional[int] = None,
+    field_name: Optional[str] = None,
+    details: Optional[dict[str, Any]] = None,
+    values: Optional[dict[str, Any]] = None,
+) -> DataQualityIssue:
+    issue_key = _semantic_hash(
+        {
+            "ipo_id": ipo_id,
+            "source_document_id": source_document_id,
+            "issue_type": issue_type,
+            "field_name": field_name,
+            "details": details,
+        }
+    )
+    issue = session.execute(
+        select(DataQualityIssue).where(DataQualityIssue.issue_key == issue_key)
+    ).scalar_one_or_none()
+    if issue is None:
+        issue = DataQualityIssue(
+            issue_key=issue_key,
+            ipo_id=ipo_id,
+            source_document_id=source_document_id,
+            issue_type=issue_type,
+            field_name=field_name,
+            severity=severity,
+            status=status,
+            details_json=details,
+        )
+        session.add(issue)
+    else:
+        issue.severity = severity
+        issue.status = status
+    _set_fields(issue, values or {})
+    return issue
 
 
 def upsert_demand_forecast(
@@ -572,6 +1067,75 @@ def count_rows(session: Session, models: Iterable[type]) -> dict[str, int]:
     return {model.__tablename__: session.query(model).count() for model in models}
 
 
+def save_notification_content_artifact(
+    session: Session,
+    *,
+    notification_event_id: int,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    content_redacted: bool = False,
+    universe_hash: Optional[str] = None,
+    evidence_hash: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> NotificationContentArtifact:
+    """Attach immutable delivery content to an existing notification ledger row.
+
+    Retrying the same event with byte-for-byte equivalent content is idempotent. A
+    different artifact is rejected so a delivered ledger row can never be silently
+    rewritten after the fact.
+    """
+
+    event = session.get(NotificationEvent, notification_event_id)
+    if event is None:
+        raise ValueError(f"Notification event not found: id={notification_event_id}")
+
+    hashes = _notification_content_hashes(subject, text_body, html_body)
+    values = {
+        "subject": subject,
+        "text_body": text_body,
+        "html_body": html_body,
+        **hashes,
+        "content_redacted": bool(content_redacted),
+        "universe_hash": universe_hash,
+        "evidence_hash": evidence_hash,
+        "metadata_json": metadata or None,
+    }
+    artifact = session.execute(
+        select(NotificationContentArtifact).where(
+            NotificationContentArtifact.notification_event_id == notification_event_id
+        )
+    ).scalar_one_or_none()
+    if artifact is None:
+        artifact = NotificationContentArtifact(
+            notification_event_id=notification_event_id,
+            **values,
+        )
+        session.add(artifact)
+        session.flush()
+        return artifact
+
+    immutable_values = {
+        column: getattr(artifact, column)
+        for column in (
+            "subject",
+            "text_body",
+            "html_body",
+            "subject_sha256",
+            "text_sha256",
+            "html_sha256",
+            "content_sha256",
+            "content_redacted",
+            "universe_hash",
+            "evidence_hash",
+            "metadata_json",
+        )
+    }
+    if immutable_values != values:
+        raise ValueError("Notification content artifact is immutable and does not match the retry")
+    return artifact
+
+
 def _assign_if_present(target: Any, name: str, value: Any) -> None:
     if value is not None:
         setattr(target, name, value)
@@ -582,3 +1146,31 @@ def _set_fields(target: Any, values: dict[str, Any]) -> None:
     for key, value in values.items():
         if key in column_names and value is not None:
             setattr(target, key, value)
+
+
+def _semantic_hash(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _notification_content_hashes(subject: str, text_body: str, html_body: str) -> dict[str, str]:
+    def digest(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    serialized = json.dumps(
+        [subject, text_body, html_body],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return {
+        "subject_sha256": digest(subject),
+        "text_sha256": digest(text_body),
+        "html_sha256": digest(html_body),
+        "content_sha256": digest(serialized),
+    }

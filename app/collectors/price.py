@@ -4,10 +4,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
+import exchange_calendars as xcals
 import numpy as np
 
 from app.exceptions import ExternalSourceError
 from app.services.clock import local_today
+from app.services.normalization import normalize_company_name
 
 
 @dataclass
@@ -39,6 +41,26 @@ class MarketConditionPayload:
 
 
 class PriceCollector:
+    def resolve_ticker(self, corp_name: str, as_of_date: Optional[date] = None) -> str:
+        """Resolve an exact KRX company-name match without accepting fuzzy candidates."""
+        if not corp_name.strip():
+            raise ValueError("corp_name is required")
+        errors = []
+        methods = (
+            (self._resolve_with_pykrx, self._resolve_with_fdr)
+            if as_of_date is not None
+            else (self._resolve_with_fdr, self._resolve_with_pykrx)
+        )
+        for method in methods:
+            try:
+                ticker = method(corp_name, as_of_date or local_today())
+                if ticker:
+                    return ticker
+            except (ImportError, ExternalSourceError, ValueError, OSError, RuntimeError) as exc:
+                errors.append(f"{method.__name__}={type(exc).__name__}: {exc}")
+        detail = "; ".join(errors) if errors else "no exact match"
+        raise ExternalSourceError(f"Ticker resolution failed for {corp_name}. {detail}")
+
     def collect_listing_prices(self, ticker: str, listing_date: date) -> ListingPricePayload:
         errors = []
         for method in (self._collect_with_pykrx, self._collect_with_fdr):
@@ -81,6 +103,41 @@ class PriceCollector:
             "financedatareader",
         )
 
+    def _resolve_with_fdr(self, corp_name: str, _as_of_date: date) -> str:
+        import FinanceDataReader as fdr  # type: ignore
+
+        listing = getattr(self, "_fdr_listing_cache", None)
+        if listing is None:
+            listing = fdr.StockListing("KRX")
+            self._fdr_listing_cache = listing
+        if listing.empty or not {"Code", "Name"}.issubset(listing.columns):
+            raise ExternalSourceError("FinanceDataReader returned no KRX listing rows")
+        target = _listing_name(corp_name)
+        matches = [
+            str(row["Code"]).strip()
+            for _, row in listing.iterrows()
+            if _listing_name(str(row["Name"])) == target
+        ]
+        matches = list(dict.fromkeys(value for value in matches if value))
+        if len(matches) != 1:
+            raise ExternalSourceError(f"FinanceDataReader exact name match count is {len(matches)}")
+        return matches[0]
+
+    def _resolve_with_pykrx(self, corp_name: str, as_of_date: date) -> str:
+        from pykrx import stock  # type: ignore
+
+        target = _listing_name(corp_name)
+        tickers = stock.get_market_ticker_list(_ymd(as_of_date), market="ALL")
+        matches = [
+            str(ticker)
+            for ticker in tickers
+            if _listing_name(stock.get_market_ticker_name(ticker)) == target
+        ]
+        matches = list(dict.fromkeys(value for value in matches if value))
+        if len(matches) != 1:
+            raise ExternalSourceError(f"pykrx exact name match count is {len(matches)}")
+        return matches[0]
+
     def _market_with_pykrx(self, as_of_date: date) -> MarketConditionPayload:
         from pykrx import stock  # type: ignore
 
@@ -114,8 +171,11 @@ def _listing_payload(
     d1 = rows[1] if len(rows) > 1 else {}
     d3 = rows[3] if len(rows) > 3 else {}
     d0_date = _row_date(d0)
-    if d0_date and d0_date < listing_date:
-        raise ExternalSourceError(f"{source} returned a row before the listing date")
+    expected_d0 = _expected_first_trade_date(listing_date)
+    if d0_date != expected_d0:
+        raise ExternalSourceError(
+            f"{source} first trade date {d0_date} does not match expected KRX session {expected_d0}"
+        )
     korean = source == "pykrx"
     return ListingPricePayload(
         ticker=ticker,
@@ -149,6 +209,15 @@ def _market_statistics(closes: list[float]) -> tuple[Optional[float], Optional[f
     return float(momentum), volatility
 
 
+def _expected_first_trade_date(listing_date: date) -> date:
+    calendar = xcals.get_calendar("XKRX")
+    end = min(listing_date + timedelta(days=10), calendar.last_session.date())
+    sessions = calendar.sessions_in_range(listing_date, end)
+    if len(sessions) == 0:
+        raise ExternalSourceError("XKRX calendar does not cover the expected listing session")
+    return sessions[0].date()
+
+
 def _row_date(row: dict[str, Any]) -> Optional[date]:
     for key in ("날짜", "Date", "date", "index"):
         value = row.get(key)
@@ -167,6 +236,16 @@ def _row_date(row: dict[str, Any]) -> Optional[date]:
 
 def _ymd(value: date) -> str:
     return value.strftime("%Y%m%d")
+
+
+def _listing_name(value: str) -> str:
+    normalized = normalize_company_name(value)
+    legal_suffix = "주식회사"
+    if normalized.startswith(legal_suffix):
+        normalized = normalized[len(legal_suffix) :]
+    if normalized.endswith(legal_suffix):
+        normalized = normalized[: -len(legal_suffix)]
+    return normalized
 
 
 def _num(value: Any) -> Optional[float]:

@@ -1,3 +1,3 @@
-"""Korea IPO Telegram bot package."""
+"""Korea IPO Assistant package."""
 
 __version__ = "0.1.0"

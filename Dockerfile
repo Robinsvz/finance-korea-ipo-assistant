@@ -8,14 +8,13 @@ RUN groupadd --gid 10001 ipo && useradd --uid 10001 --gid ipo --create-home ipo
 
 WORKDIR /app
 
-COPY requirements.txt requirements.lock pyproject.toml ./
-RUN pip install --upgrade pip && pip install -r requirements.lock
+COPY requirements.runtime.lock ./
+RUN pip install --upgrade pip && pip install -r requirements.runtime.lock
 
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
 COPY configs ./configs
-COPY README.md IMPROVEMENT_PLAN.md ./
 
 RUN mkdir -p /app/data/raw && chown -R ipo:ipo /app
 

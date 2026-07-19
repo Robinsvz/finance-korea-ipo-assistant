@@ -89,7 +89,21 @@ UNIQUE_INDEXES = {
 
 def upgrade() -> None:
     bind = op.get_bind()
-    Base.metadata.create_all(bind=bind)
+    deferred_tables = {
+        "user_participations",
+        "participation_exits",
+        "source_documents",
+        "ipo_fact_observations",
+        "ipo_schedule_revisions",
+        "monthly_universe_snapshots",
+        "broker_term_versions",
+        "data_quality_issues",
+        "notification_content_artifacts",
+    }
+    initial_tables = [
+        table for table in Base.metadata.sorted_tables if table.name not in deferred_tables
+    ]
+    Base.metadata.create_all(bind=bind, tables=initial_tables)
     inspector = inspect(bind)
     tables = set(inspector.get_table_names())
     for table_name, definitions in LEGACY_COLUMNS.items():

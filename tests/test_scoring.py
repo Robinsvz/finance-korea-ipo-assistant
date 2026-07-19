@@ -9,6 +9,7 @@ from app.services.scoring import (
 
 
 def test_score_institutional_competition_thresholds():
+    assert score_institutional_competition(None) == 0
     assert score_institutional_competition(1500) == 10
     assert score_institutional_competition(1000) == 8
     assert score_institutional_competition(500) == 6
@@ -27,6 +28,13 @@ def test_score_demand_combines_fields():
     score, explanation = score_demand(demand)
     assert score == 20
     assert explanation["ratio_score"] == 8
+
+
+def test_score_demand_normalizes_percentage_lockup():
+    demand = DemandForecast(lockup_commitment_ratio=30)
+    score, explanation = score_demand(demand)
+    assert score == 7
+    assert explanation["lockup_score"] == 7
 
 
 def test_score_financial_profitable_growth():

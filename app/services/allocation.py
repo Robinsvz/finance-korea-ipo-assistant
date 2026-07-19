@@ -83,6 +83,7 @@ def derive_allocation_assumptions(
     session: Session,
     underwriter: Optional[UnderwriterAllocation],
     history_limit: int = 20,
+    as_of: Optional[datetime] = None,
 ) -> AllocationAssumptions:
     configured, _units = load_allocation_assumptions(
         underwriter.broker_name if underwriter else None
@@ -102,18 +103,21 @@ def derive_allocation_assumptions(
         source=underwriter.assumption_source or configured.source,
         updated_at=underwriter.assumption_updated_at or configured.updated_at,
     )
+    stmt = select(UnderwriterAllocation).where(
+        UnderwriterAllocation.broker_name == underwriter.broker_name,
+        UnderwriterAllocation.id != underwriter.id,
+        UnderwriterAllocation.actual_proportional_competition.is_not(None),
+    )
+    if as_of is not None:
+        stmt = stmt.where(
+            UnderwriterAllocation.actual_recorded_at.is_not(None),
+            UnderwriterAllocation.actual_recorded_at < as_of,
+        )
     history = list(
         session.execute(
-            select(UnderwriterAllocation)
-            .where(
-                UnderwriterAllocation.broker_name == underwriter.broker_name,
-                UnderwriterAllocation.id != underwriter.id,
-                UnderwriterAllocation.actual_proportional_competition.is_not(None),
-            )
-            .order_by(
+            stmt.order_by(
                 desc(UnderwriterAllocation.actual_recorded_at), desc(UnderwriterAllocation.id)
-            )
-            .limit(history_limit)
+            ).limit(history_limit)
         ).scalars()
     )
     if len(history) < 3:
@@ -240,12 +244,16 @@ def build_allocation_scenario(
         subscription_fee=int(fee),
     )
     estimated_deposit = int(apply_shares * offer_price * deposit_rate)
-    equal_mid = calculate_equal_expected(
-        underwriter.retail_allocated_shares if underwriter else None,
-        underwriter.equal_allocation_ratio
-        if underwriter and underwriter.equal_allocation_ratio
-        else 0.5,
-        assumptions.expected_applicants_count,
+    equal_mid = (
+        calculate_equal_expected(
+            underwriter.retail_allocated_shares if underwriter else None,
+            underwriter.equal_allocation_ratio
+            if underwriter and underwriter.equal_allocation_ratio
+            else 0.5,
+            assumptions.expected_applicants_count,
+        )
+        if apply_shares > 0
+        else 0.0
     )
     padding = assumptions.equal_range_padding
     equal_low = max(equal_mid * (1 - padding), 0)

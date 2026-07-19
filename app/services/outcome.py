@@ -10,8 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.models import Ipo, ListingPrice, OutcomeEvaluation, ScoreSnapshot
 from app.repositories import upsert_outcome_evaluation
+from app.services.scoring_v3 import resolve_scoring_identity
 
-EVALUATION_VERSION = "outcome-v2"
+EVALUATION_VERSION = "outcome-v3-subscription-open"
 
 
 def add_business_days(start: date, days: int) -> date:
@@ -29,16 +30,32 @@ def add_business_days(start: date, days: int) -> date:
 
 
 class OutcomeEvaluationService:
+    def __init__(
+        self,
+        *,
+        model_version: Optional[str] = None,
+        rules_hash: Optional[str] = None,
+    ) -> None:
+        self.model_version, self.rules_hash = resolve_scoring_identity(
+            model_version,
+            rules_hash,
+        )
+
     def evaluate_and_save(self, session: Session, ipo: Ipo) -> OutcomeEvaluation:
         listing_price = latest_listing_price(session, ipo.id)
-        score = latest_pre_listing_score(
-            session, ipo.id, ipo.actual_listing_date or ipo.listing_date
+        score = latest_actionable_score(
+            session,
+            ipo.id,
+            ipo.subscription_start_date,
+            ipo.actual_listing_date or ipo.listing_date,
+            model_version=self.model_version,
+            rules_hash=self.rules_hash,
         )
         if listing_price is None:
             raise ValueError(f"Listing price is missing for {ipo.corp_name}")
-        offer_price = ipo.offer_price_final or ipo.offer_price_max or ipo.offer_price_min
+        offer_price = ipo.offer_price_final
         if not offer_price:
-            raise ValueError(f"Offer price is missing for {ipo.corp_name}")
+            raise ValueError(f"Final offer price is missing for {ipo.corp_name}")
 
         d0_open_return = pct_return(listing_price.d0_open_price, offer_price)
         d0_close_return = pct_return(listing_price.d0_close_price, offer_price)
@@ -64,9 +81,9 @@ class OutcomeEvaluationService:
             "estimated_profit_per_share_d3": profit_per_share(
                 listing_price.d3_close_price, offer_price
             ),
-            "label_open_success": d0_open_return is not None and d0_open_return > 0,
-            "label_d1_success": d1_close_return is not None and d1_close_return > 0,
-            "label_d3_success": d3_close_return is not None and d3_close_return > 0,
+            "label_open_success": success_label(d0_open_return),
+            "label_d1_success": success_label(d1_close_return),
+            "label_d3_success": success_label(d3_close_return),
             "prediction_was_correct": prediction,
             "error_reason": None
             if prediction is not None
@@ -80,6 +97,10 @@ class OutcomeEvaluationService:
             evaluation_version=EVALUATION_VERSION,
             values=values,
         )
+        # Repository upserts intentionally ignore None values. Clear a prior
+        # directional label when a safety-only/non-directional band is reevaluated.
+        evaluation.prediction_was_correct = prediction
+        evaluation.error_reason = values["error_reason"]
         if d3_close_return is not None:
             ipo.status = "evaluated"
             ipo.status_changed_at = datetime.now(timezone.utc)
@@ -110,6 +131,10 @@ def prediction_correct(
     return None
 
 
+def success_label(return_pct: Optional[float]) -> Optional[bool]:
+    return return_pct > 0 if return_pct is not None else None
+
+
 def latest_listing_price(session: Session, ipo_id: int) -> Optional[ListingPrice]:
     stmt = (
         select(ListingPrice)
@@ -123,17 +148,67 @@ def latest_pre_listing_score(
     session: Session,
     ipo_id: int,
     listing_date: Optional[date],
+    *,
+    model_version: Optional[str] = None,
+    rules_hash: Optional[str] = None,
 ) -> Optional[ScoreSnapshot]:
+    return _latest_score_before(
+        session,
+        ipo_id,
+        listing_date,
+        model_version=model_version,
+        rules_hash=rules_hash,
+    )
+
+
+def latest_actionable_score(
+    session: Session,
+    ipo_id: int,
+    subscription_start_date: Optional[date],
+    listing_date: Optional[date],
+    *,
+    model_version: Optional[str] = None,
+    rules_hash: Optional[str] = None,
+) -> Optional[ScoreSnapshot]:
+    """Use a score available before subscription opens from one exact lineage.
+
+    The safe default is the active v3 configuration. Historical callers can select a
+    legacy lineage by explicitly providing both its model version and rules hash.
+    """
+    active_model, active_rules_hash = resolve_scoring_identity(model_version, rules_hash)
+    return _latest_score_before(
+        session,
+        ipo_id,
+        subscription_start_date or listing_date,
+        model_version=active_model,
+        rules_hash=active_rules_hash,
+    )
+
+
+def _latest_score_before(
+    session: Session,
+    ipo_id: int,
+    cutoff_date: Optional[date],
+    *,
+    model_version: Optional[str] = None,
+    rules_hash: Optional[str] = None,
+) -> Optional[ScoreSnapshot]:
+    if rules_hash is not None and model_version is None:
+        raise ValueError("model_version is required when rules_hash is specified")
     stmt = select(ScoreSnapshot).where(ScoreSnapshot.ipo_id == ipo_id)
-    if listing_date:
+    if model_version is not None:
+        stmt = stmt.where(ScoreSnapshot.model_version == model_version)
+    if rules_hash is not None:
+        stmt = stmt.where(ScoreSnapshot.rules_hash == rules_hash)
+    if cutoff_date:
         market_open_kst = datetime.combine(
-            listing_date,
+            cutoff_date,
             time(9, 0),
             tzinfo=ZoneInfo("Asia/Seoul"),
         )
         cutoff_utc = market_open_kst.astimezone(timezone.utc)
         stmt = stmt.where(
-            ScoreSnapshot.score_date <= listing_date,
+            ScoreSnapshot.score_date <= cutoff_date,
             ScoreSnapshot.calculated_at < cutoff_utc,
         )
     stmt = stmt.order_by(desc(ScoreSnapshot.calculated_at), desc(ScoreSnapshot.id))

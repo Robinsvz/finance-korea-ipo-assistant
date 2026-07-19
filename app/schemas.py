@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from app.models import Ipo
 
 
 @dataclass
@@ -46,6 +49,35 @@ class AllocationResult:
     assumption_updated_at: Optional[datetime] = None
 
 
+@dataclass(frozen=True)
+class MonthlyUniverseEntry:
+    """One canonical offering and the events that place it in a monthly cohort."""
+
+    ipo: "Ipo"
+    ipo_id: int
+    offering_id: str
+    event_badges: tuple[str, ...]
+    inclusion_dates: Dict[str, tuple[date, ...]]
+    reconciliation_state: str
+    planned_listing_date: Optional[date]
+    actual_listing_date: Optional[date]
+    display_listing_date: Optional[date]
+
+
+@dataclass(frozen=True)
+class MonthlyUniverseResult:
+    """Core monthly activity plus filing-only rows excluded from the core count."""
+
+    month_start: date
+    month_end: date
+    core: tuple[MonthlyUniverseEntry, ...]
+    filing_update_appendix: tuple[MonthlyUniverseEntry, ...]
+
+    @property
+    def core_count(self) -> int:
+        return len(self.core)
+
+
 @dataclass
 class HealthStatus:
     database_ok: bool
@@ -53,6 +85,7 @@ class HealthStatus:
     schema_revision: Optional[str]
     expected_schema_revision: Optional[str]
     telegram_configured: bool
+    email_configured: bool
     dart_configured: bool
     naver_configured: bool
     database_url: str

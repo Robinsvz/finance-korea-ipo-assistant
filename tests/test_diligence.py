@@ -4,7 +4,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db import Base
-from app.models import DemandForecast, DiligenceReview, Ipo, NewsMetric
+from app.models import (
+    DemandForecast,
+    DiligenceReview,
+    FinancialMetric,
+    Ipo,
+    NewsMetric,
+    SourceSnapshot,
+)
 from app.services.diligence import DiligenceCriteria, build_diligence_report
 
 
@@ -128,3 +135,88 @@ def test_collected_evidence_is_not_manual_review():
     disclosure = report["items"][0]["criteria"]["disclosure_review"]
     assert disclosure["passed"] is False
     assert "manual_disclosure_review" in disclosure["missing"]
+
+
+def test_stale_disclosure_scores_raw_and_financial_evidence_as_partial():
+    session = _session()
+    old = datetime.now(timezone.utc) - timedelta(days=30)
+    ipo = Ipo(
+        corp_name="오래된공시",
+        normalized_name="오래된공시",
+        status="scheduled",
+        dart_corp_code="D1",
+        dart_receipt_no="R1",
+    )
+    session.add(ipo)
+    session.flush()
+    session.add_all(
+        [
+            FinancialMetric(ipo_id=ipo.id, fiscal_year=2025, source="opendart"),
+            SourceSnapshot(
+                ipo_id=ipo.id,
+                source="opendart_document",
+                source_key="R1",
+                fetched_at=old,
+                raw_text_hash="hash",
+            ),
+            DiligenceReview(
+                ipo_id=ipo.id,
+                review_type="disclosure",
+                review_status="reviewed",
+                reviewed_by="tester",
+                reviewed_at=datetime.now(timezone.utc),
+            ),
+        ]
+    )
+    session.flush()
+
+    disclosure = build_diligence_report(session, [ipo])["items"][0]["criteria"]["disclosure_review"]
+
+    assert disclosure["passed"] is False
+    assert disclosure["score"] == 75
+    assert "fresh_opendart_review" in disclosure["missing"]
+
+
+def test_article_review_reports_partial_and_all_missing_quality_inputs():
+    session = _session()
+    now = datetime.now(timezone.utc)
+    fresh = Ipo(corp_name="기사있음", normalized_name="기사있음", status="scheduled")
+    stale = Ipo(corp_name="기사부족", normalized_name="기사부족", status="scheduled")
+    session.add_all([fresh, stale])
+    session.flush()
+    session.add_all(
+        [
+            NewsMetric(
+                ipo_id=fresh.id,
+                source="test",
+                window_start=date.today() - timedelta(days=30),
+                window_end=date.today(),
+                deduped_article_count=1,
+                top_articles_json=[{"title": "기사", "link": "https://example.com"}],
+                updated_at=now,
+            ),
+            NewsMetric(
+                ipo_id=stale.id,
+                source="test",
+                window_start=date.today() - timedelta(days=30),
+                window_end=date.today(),
+                deduped_article_count=0,
+                top_articles_json=[],
+                updated_at=now - timedelta(days=30),
+            ),
+        ]
+    )
+    session.flush()
+
+    items = build_diligence_report(session, [fresh, stale])["items"]
+    fresh_articles = items[0]["criteria"]["article_review"]
+    stale_articles = items[1]["criteria"]["article_review"]
+
+    assert fresh_articles["score"] == 98
+    assert "manual_article_review" in fresh_articles["missing"]
+    assert {
+        "minimum_article_count",
+        "top_article_links",
+        "fresh_article_review",
+        "manual_article_review",
+    }.issubset(stale_articles["missing"])

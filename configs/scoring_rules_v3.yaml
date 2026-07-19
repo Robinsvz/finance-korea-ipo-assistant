@@ -1,0 +1,29 @@
+model_version: rules-v3-simple
+
+pillar_weights:
+  demand: 45
+  supply: 30
+  pricing: 15
+  market: 10
+
+confidence:
+  minimum_for_recommendation: 90
+
+recommendation_band:
+  strong: 80
+  watch: 65
+  neutral: 50
+
+market_condition:
+  neutral_score: 5
+  kosdaq_momentum_positive: 0.05
+  kosdaq_momentum_negative: -0.05
+  recent_ipo_success_high: 0.60
+  recent_ipo_success_low: 0.35
+
+severe_risk_flags:
+  - 상장철회
+  - 감사의견
+  - 횡령
+  - 배임
+  - 과징금

@@ -177,7 +177,7 @@ class NaverNewsCollector:
                 if dated and min(dated) < window_start:
                     break
                 start += display
-                if start > min(api_total, 1000):
+                if start > api_total:
                     break
 
         in_window_raw = [

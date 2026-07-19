@@ -3,8 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import desc, select
@@ -31,13 +30,13 @@ from app.services.allocation import (
     derive_allocation_assumptions,
     resolve_underwriter,
 )
-from app.services.backtest import build_backtest_report
+from app.services.backtest import build_operational_backtest
 from app.services.clock import format_local_datetime, local_today
 from app.services.formatter import (
     format_allocation,
-    format_backtest,
     format_financial,
     format_ipo_summary,
+    format_operational_backtest,
     format_result,
     format_schedule,
     format_score,
@@ -46,7 +45,9 @@ from app.services.formatter import (
 from app.services.observability import (
     finish_notification,
     latest_job_statuses,
+    mask_secrets,
     reserve_notification,
+    run_tracked_job,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,7 @@ TELEGRAM_COMMANDS = (
     ("trend", "뉴스·검색 추이"),
     ("financial", "재무 요약"),
     ("result", "상장 후 검증"),
+    ("backtest", "등급별 모델 검증"),
     ("sources", "데이터 출처와 갱신 시각"),
     ("status", "수집 작업 상태"),
     ("refresh", "종목 데이터 다시 수집(관리자)"),
@@ -144,8 +146,8 @@ def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
             current = line
         else:
             current += line
-    if current:
-        chunks.append(current.rstrip())
+    # len(text) > limit guarantees the final split line leaves a non-empty remainder.
+    chunks.append(current.rstrip())
     return [chunk for chunk in chunks if chunk]
 
 
@@ -153,20 +155,31 @@ def is_chat_authorized(chat_id: Any, allowed_chat_ids: tuple[str, ...]) -> bool:
     return chat_id is not None and str(chat_id) in allowed_chat_ids
 
 
-def consume_refresh_cooldown(
+def acquire_refresh_cooldown(
     user_id: Any,
-    last_used: dict[str, float],
     *,
-    now: Optional[float] = None,
+    now: Optional[datetime] = None,
     cooldown_seconds: int = 60,
 ) -> int:
-    current = time.monotonic() if now is None else now
-    key = str(user_id)
-    remaining = cooldown_seconds - (current - last_used.get(key, -float("inf")))
-    if remaining > 0:
-        return math.ceil(remaining)
-    last_used[key] = current
-    return 0
+    """Acquire a database-backed cooldown shared across restarts and bot replicas."""
+    if cooldown_seconds <= 0:
+        raise ValueError("cooldown_seconds must be positive")
+    current = now or datetime.now(timezone.utc)
+    event, acquired = reserve_notification(
+        "telegram-command-cooldown",
+        "refresh",
+        str(user_id),
+        lease_seconds=cooldown_seconds,
+        now=current,
+    )
+    if acquired:
+        return 0
+    lease_until = event.lease_until
+    if lease_until is None:
+        return cooldown_seconds
+    if lease_until.tzinfo is None:
+        lease_until = lease_until.replace(tzinfo=timezone.utc)
+    return max(1, math.ceil((lease_until - current).total_seconds()))
 
 
 def run_bot() -> None:
@@ -178,7 +191,6 @@ def run_bot() -> None:
         raise ValueError("TELEGRAM_BOT_TOKEN is missing")
     if not settings.allowed_telegram_chat_ids:
         raise ValueError("TELEGRAM_ALLOWED_CHAT_IDS or TELEGRAM_CHAT_ID must be configured")
-    refresh_last_used: dict[str, float] = {}
 
     async def authorized(update: Update) -> bool:
         chat = update.effective_chat
@@ -290,10 +302,11 @@ def run_bot() -> None:
             raise ValueError(
                 "/refresh 권한이 없습니다. 개인 user id를 관리자 목록에 등록해 주세요."
             )
-        remaining = consume_refresh_cooldown(user.id, refresh_last_used)
+        name = _required_name(context, "/refresh 종목명")
+        name = await asyncio.to_thread(_validated_ipo_name, name)
+        remaining = await asyncio.to_thread(acquire_refresh_cooldown, user.id)
         if remaining:
             raise ValueError(f"/refresh는 {remaining}초 후 다시 실행할 수 있습니다.")
-        name = _required_name(context, "/refresh 종목명")
         await _reply(update, "수집을 시작합니다. 완료까지 시간이 걸릴 수 있습니다.")
         await _reply(update, await asyncio.to_thread(_refresh_text, name))
 
@@ -425,7 +438,7 @@ def _result_text(name: str) -> str:
 
 def _backtest_text() -> str:
     with session_scope() as session:
-        return format_backtest(build_backtest_report(session))
+        return format_operational_backtest(build_operational_backtest(session))
 
 
 def _status_text() -> str:
@@ -514,10 +527,31 @@ def _why_text(name: str) -> str:
 
 
 def _refresh_text(name: str) -> str:
+    result = run_tracked_job(
+        "telegram_manual_refresh",
+        lambda: _run_refresh_operations(name),
+    )
+    labels = {
+        "success": "완료",
+        "partial": "부분 성공",
+        "skipped": "건너뜀",
+        "failed": "실패",
+    }
+    lines = [f"[수집 결과] {result['ipo']}"]
+    for item in result["results"]:
+        state = labels[item["status"]]
+        if item.get("detail"):
+            state = f"{state} · {item['detail']}"
+        lines.append(f"- {item['label']}: {state}")
+    return "\n".join(lines)
+
+
+def _run_refresh_operations(name: str) -> dict[str, Any]:
     from app.services.jobs import (
         collect_dart_for_ipo,
         collect_financials_for_ipo,
         collect_news_trend_for_ipo,
+        operation_status,
         score_one,
     )
 
@@ -527,22 +561,33 @@ def _refresh_text(name: str) -> str:
         ("뉴스·검색", collect_news_trend_for_ipo),
         ("점수", score_one),
     )
-    lines = ["[수집 결과]"]
+    counts = {"success": 0, "partial": 0, "skipped": 0, "failed": 0}
+    results = []
     for label, operation in operations:
         try:
-            result = operation(name)
-            if result.get("skipped"):
-                state = f"건너뜀 · {result.get('reason', '-')}"
-            elif result.get("errors"):
-                state = f"부분 성공 · {'; '.join(result['errors'])}"
-            elif result.get("updated") is False:
-                state = f"미갱신 · {result.get('reason', '-')}"
-            else:
-                state = "완료"
+            operation_result = operation(name)
+            status = operation_status(operation_result)
+            detail = _refresh_result_detail(operation_result)
         except Exception as exc:
-            state = f"실패 · {type(exc).__name__}: {exc}"
-        lines.append(f"- {label}: {state}")
-    return "\n".join(lines)
+            status = "failed"
+            detail = mask_secrets(f"{type(exc).__name__}: {exc}")
+        counts[status] += 1
+        results.append({"label": label, "status": status, "detail": detail})
+    return {
+        "ipo": name,
+        "processed": len(operations),
+        **counts,
+        "results": results,
+    }
+
+
+def _refresh_result_detail(result: dict[str, Any]) -> Optional[str]:
+    detail = (
+        result.get("errors") or result.get("error") or result.get("warning") or result.get("reason")
+    )
+    if isinstance(detail, list):
+        detail = "; ".join(str(item) for item in detail)
+    return mask_secrets(str(detail)) if detail else None
 
 
 async def _reply(update: Any, text: str) -> None:
@@ -565,6 +610,11 @@ def _find_or_raise(session: Any, name: str):
         message = str(exc).replace("IPO not found", "IPO를 찾지 못했습니다")
         message = message.replace("IPO name is ambiguous", "같은 이름의 IPO가 여러 건입니다")
         raise ValueError(message) from exc
+
+
+def _validated_ipo_name(name: str) -> str:
+    with session_scope() as session:
+        return _find_or_raise(session, name).corp_name
 
 
 def _looks_like_amount(value: str) -> bool:

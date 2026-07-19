@@ -8,6 +8,7 @@ from app.config import load_yaml_config
 
 BROKER_SUFFIX_PATTERNS = [
     r"\(주\)",
+    r"㈜",
     r"주식회사",
     r"증권주식회사",
 ]
@@ -35,6 +36,8 @@ def normalize_broker_name(name: str) -> str:
         "하나증권": "하나증권",
         "케이비증권": "KB증권",
         "KB증권": "KB증권",
+        "아이비케이투자증권": "IBK투자증권",
+        "IBK투자증권": "IBK투자증권",
     }
     try:
         configured = load_yaml_config("brokers.yaml").get("brokers", {})
