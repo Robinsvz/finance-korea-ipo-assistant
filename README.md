@@ -4,6 +4,14 @@
 
 이 프로젝트는 참고용 데이터 정리 도구입니다. 청약 신청, 증권사 로그인, 주문 제출, 매수·매도 자동화 기능은 없으며 출력 점수와 등급은 투자 추천이나 수익 보장이 아닙니다.
 
+## Repository Status
+
+- README snapshot: 2026-07-19 KST.
+- Pipeline state: collection, normalization, scoring gates, notifications, and realized-result ledger are operational; `rules-v3-simple` predictive power is not yet validated.
+- Decision posture: `RESEARCH_ONLY` or stricter until at least 30 leak-free complete pre-subscription score-to-D1 samples satisfy the validation policy.
+- Email schedule: each eligible IPO receives an independent facts-only D-1 email at 09:00 KST after the 07:20–08:45 evidence refresh and quality sequence.
+- Source of truth: [MASTER_PLAN.md](MASTER_PLAN.md) for readiness/decision policy and [COVERAGE_100_LOG.md](COVERAGE_100_LOG.md) for the current test inventory.
+
 ## 주요 기능
 
 - KIND 전체 페이지 일정 수집, 일정 필드 보존, 라이프사이클 상태 자동 갱신
@@ -165,11 +173,11 @@ cp .env.example .env
 .venv/bin/python -m app.cli send-monthly-email --month 2026-07 --canary
 ```
 
-v3 자동 이메일은 **일반청약 시작일의 전날(D-1, KST 달력일) 18:30**에 종목마다 한 통씩 발송합니다. 기준은 상장일이 아닙니다. 같은 날 청약을 시작하는 IPO가 N개면 서로 합치지 않고 N개의 독립 메일을 만들며, 한 종목의 실패가 다른 종목 발송을 막지 않습니다. 월요일 주간 v3 집계 메일은 예약 발송에서 제거하거나 `skipped`로 끝내고, 월간 전체 화면은 모집단·과거 데이터 감사를 위한 명시적 preview/canary로만 보존합니다.
+v3 자동 이메일은 **일반청약 시작일의 전날(D-1, KST 달력일) 오전 09:00**에 종목마다 한 통씩 발송합니다. 기준은 상장일이 아닙니다. 같은 날 청약을 시작하는 IPO가 N개면 서로 합치지 않고 N개의 독립 메일을 만들며, 한 종목의 실패가 다른 종목 발송을 막지 않습니다. 월요일 주간 v3 집계 메일은 예약 발송에서 제거하거나 `skipped`로 끝내고, 월간 전체 화면은 모집단·과거 데이터 감사를 위한 명시적 preview/canary로만 보존합니다.
 
 각 종목 메일은 본문 맨 위의 `한눈에 보기`에서 청약 일정·공모가·밴드·주관사와 핵심 사실을 먼저 보여 줍니다. 기관 가격분포는 공모가 밴드 대비 어느 가격 구간에 참여가 몰렸는지 확인할 수 있도록 **참여기관 수**와 **신청수량**을 서로 다른 막대로 표시합니다. 정확한 합계·출처·기준시각을 함께 적고, 가격 미제시 건은 별도 구간으로 둡니다. 원자료 비율 합계가 100%와 다르더라도 억지로 정규화하지 않으며, 확인되지 않은 값이나 사후 일반청약 결과를 D-1 사실로 가장하지 않습니다.
 
-수신자는 `dummy1.kim@gmail.com` 한 명으로 고정됩니다. D-1 17:30에 공개 DART 근거를 다시 수집하고 18:10에 품질을 대조한 뒤 18:30에 발송합니다. 최신 공식 KIND 청약기간과 현재 일정의 일치만 일정 hard gate로 사용하며, DART 가격분포가 아직 없으면 종목을 숨기지 않고 `공시 전`과 품질 경고를 표시합니다. event key는 안정적인 offering identity의 SHA-256 요약과 청약 시작일로 고정해 근거가 갱신돼도 같은 occurrence를 재발송하지 않고, universe/evidence hash는 감사 metadata에 보존합니다. SMTP 결과가 불명확한 메일은 자동 재전송하지 않습니다. 현재 DB의 gross 과거 결과는 설명용 분포로만 표시하며, point-in-time 완전 표본 30건과 별도 검증 승인을 충족하기 전에는 양수 확률·기대수익·청약 추천을 만들지 않습니다.
+수신자는 `dummy1.kim@gmail.com` 한 명으로 고정됩니다. D-1 07:20에 KIND 일정, 07:25에 KIND 신규상장, 07:30에 공개 DART 근거를 갱신하고 08:45에 품질을 대조한 뒤 09:00에 발송합니다. 최신 공식 KIND 청약기간과 현재 일정의 일치만 일정 hard gate로 사용하며, 오전 발송 시점까지 DART 가격분포가 없으면 종목을 숨기지 않고 `공시 전`과 품질 경고를 표시합니다. event key는 안정적인 offering identity의 SHA-256 요약과 청약 시작일로 고정해 근거가 갱신돼도 같은 occurrence를 재발송하지 않고, universe/evidence hash는 감사 metadata에 보존합니다. SMTP 결과가 불명확한 메일은 자동 재전송하지 않습니다. 현재 DB의 gross 과거 결과는 설명용 분포로만 표시하며, point-in-time 완전 표본 30건과 별도 검증 승인을 충족하기 전에는 양수 확률·기대수익·청약 추천을 만들지 않습니다.
 
 D-1 전환의 코드·회귀·Docker 검증은 완료됐고, 실제 SMTP·inbox 검수는 다음 D-1 대상일에 수행합니다. 상세 증거와 미완료 항목은 [IPO_EMAIL_V3_AND_HISTORICAL_EVIDENCE_PLAN.md](plans/IPO_EMAIL_V3_AND_HISTORICAL_EVIDENCE_PLAN.md)의 P2.1과 진행 로그를 기준으로 판단합니다.
 
@@ -220,6 +228,9 @@ D-1 전환의 코드·회귀·Docker 검증은 완료됐고, 실제 SMTP·inbox 
 | 07:05 | KIND 당월 신규상장 전체 페이지 수집 |
 | 07:10 | IPO 상태 갱신 |
 | 07:15 | 당월 IPO DART 공개 공시·문서 계보 수집 |
+| 07:20 | 다음 날 청약 시작 IPO의 KIND 일정 새로고침 |
+| 07:25 | 다음 날 청약 시작 IPO의 KIND 신규상장 새로고침 |
+| 07:30 | 다음 날 청약 시작 IPO의 공개 DART 근거 새로고침 |
 | 07:35 | 활성 IPO OpenDART API 공시 수집 |
 | 07:40 | 활성 IPO 재무 수집 |
 | 08:00 | 활성 IPO 뉴스·검색 수집 |
@@ -228,14 +239,11 @@ D-1 전환의 코드·회귀·Docker 검증은 완료됐고, 실제 SMTP·inbox 
 | 08:20 | 활성 IPO 점수 upsert |
 | 08:30 | 오늘 일정 알림 |
 | 월요일 08:35 | 주간 일정 알림 |
+| 08:45 | 다음 날 청약 시작 IPO의 일정·표시 근거 품질 대조 |
+| 09:00 | 일반청약 시작 D-1 종목별 facts-only 이메일(대상 N개면 N통) |
+| 매월 1일 09:00 | 등급별 백테스트 알림 |
 | 16:30 | 상장일~D3 가격 수집 |
 | 17:00 | D3 결과 평가 |
-| 17:10 | 다음 날 청약 시작 IPO의 KIND 일정 새로고침 |
-| 17:20 | 다음 날 청약 시작 IPO의 KIND 신규상장 새로고침 |
-| 17:30 | 다음 날 청약 시작 IPO의 공개 DART 근거 새로고침 |
-| 18:10 | 다음 날 청약 시작 IPO의 일정·표시 근거 품질 대조 |
-| 18:30 | 일반청약 시작 D-1 종목별 facts-only 이메일(대상 N개면 N통) |
-| 매월 1일 09:00 | 등급별 백테스트 알림 |
 
 각 잡은 `max_instances=1`, `coalesce=true`, 1시간 misfire 유예를 사용합니다. 종목 단위 작업은 한 종목 실패가 배치를 중단하지 않으며 실패한 종목만 1회 추가 재시도합니다. 결과는 `succeeded`, `partial`, `failed`로 `job_runs`에 기록되고 실패·부분 실패는 Telegram 운영 경보로 전달됩니다. Telegram과 이메일 발송 잡은 서로 독립적이라 한 채널 장애가 다른 채널을 중단시키지 않습니다. 주간 Telegram 일정 알림은 유지하지만 주간 v3 이메일은 발송하지 않습니다.
 
@@ -311,7 +319,7 @@ sqlite3 data/ipo.db "PRAGMA foreign_key_check;"
 
 테스트는 외부 네트워크 없이 KIND/DART/Naver/가격/Telegram·SMTP 계약, 상태 전이, 자연키 upsert, 점수·gate 경계, 배정·가치 판단, 참여 원장, 한국 거래일, 시점 누출, 결과 평가, 백테스트, 빈 DB 마이그레이션을 검증합니다. GitHub Actions는 Python 3.9와 3.11에서 Ruff, Alembic, pytest·coverage, 의존성 검사를 실행합니다.
 
-`app/` 전체의 statement와 branch coverage 하한은 모두 100%입니다. omit 예외 없이 CLI·외부 collector·포매터·스케줄러까지 계측하므로 미실행 문장이나 분기가 생기면 로컬 품질 게이트와 CI가 실패합니다. 현재 기준은 681개 테스트, 9,347문장·2,678분기, 누락·부분 분기 0입니다.
+`app/` 전체의 statement와 branch coverage 하한은 모두 100%입니다. omit 예외 없이 CLI·외부 collector·포매터·스케줄러까지 계측하므로 미실행 문장이나 분기가 생기면 로컬 품질 게이트와 CI가 실패합니다. 현재 기준은 681개 테스트, 9,348문장·2,678분기, 누락·부분 분기 0입니다.
 
 검증 노트북은 다음 명령으로 재생성한 뒤 처음부터 끝까지 실행할 수 있습니다.
 
