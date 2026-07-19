@@ -7,6 +7,8 @@
 ## Repository Status
 
 - README snapshot: 2026-07-19 KST.
+- GitHub: `https://github.com/Robinsvz/finance-korea-ipo-assistant`
+- Local checkout: `/Users/jk/Documents/GitHub/korea-ipo-telegram-bot` (legacy folder retained for path compatibility).
 - Pipeline state: collection, normalization, scoring gates, notifications, and realized-result ledger are operational; `rules-v3-simple` predictive power is not yet validated.
 - Decision posture: `RESEARCH_ONLY` or stricter until at least 30 leak-free complete pre-subscription score-to-D1 samples satisfy the validation policy.
 - Email schedule: each eligible IPO receives an independent facts-only D-1 email at 09:00 KST after the 07:20–08:45 evidence refresh and quality sequence.
