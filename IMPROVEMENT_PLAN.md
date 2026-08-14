@@ -8,7 +8,7 @@
 |---|---|
 | 문서 상태 | Implemented v1.2 — 검증·이메일·참여 원장 반영 |
 | 작성일 | 2026-07-19 |
-| 대상 프로젝트 | `korea-ipo-telegram-bot` |
+| 대상 프로젝트 | `finance-korea-ipo-assistant` |
 | 목표 릴리스 | v1.2.0 구현 완료 |
 | 주요 사용자 | 국내 공모주 일정을 확인하고 청약 판단 자료를 정리하는 개인 사용자 |
 | 운영 채널 | CLI, Telegram, Email, APScheduler, Docker Compose |
