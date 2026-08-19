@@ -8,7 +8,7 @@
 
 - README snapshot: 2026-07-19 KST.
 - GitHub: `https://github.com/Robinsvz/finance-korea-ipo-assistant`
-- Local checkout: `/Users/jk/Documents/GitHub/korea-ipo-telegram-bot` (legacy folder retained for path compatibility).
+- Local checkout: `/Users/jk/Documents/GitHub/finance-workspace/finance-korea-ipo-assistant`.
 - Pipeline state: collection, normalization, scoring gates, notifications, and realized-result ledger are operational; `rules-v3-simple` predictive power is not yet validated.
 - Decision posture: `RESEARCH_ONLY` or stricter until at least 30 leak-free complete pre-subscription score-to-D1 samples satisfy the validation policy.
 - Email schedule: each eligible IPO receives an independent facts-only D-1 email at 09:00 KST after the 07:20–08:45 evidence refresh and quality sequence.
@@ -46,7 +46,7 @@
 ## 로컬 설치
 
 ```bash
-cd /Users/jk/Documents/GitHub/korea-ipo-telegram-bot
+cd /Users/jk/Documents/GitHub/finance-workspace/finance-korea-ipo-assistant
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.lock
